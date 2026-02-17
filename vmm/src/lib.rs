@@ -970,6 +970,18 @@ impl Vmm {
         *postponed_event = None;
     }
 
+    /// Replays and clears the postponed lifecycle event.
+    fn replay_postponed_lifecycle_event(&self) {
+        let mut postponed_event = self.postponed_lifecycle_event.lock().unwrap();
+        let Some(event) = *postponed_event else {
+            return;
+        };
+        match replay_lifecycle_event(event, &self.reset_evt, &self.guest_exit_evt) {
+            Ok(()) => *postponed_event = None,
+            Err(e) => error!("Failed replaying postponed lifecycle event: {e}"),
+        }
+    }
+
     /// Try to receive a file descriptor from a socket. Returns the slot number and the file descriptor.
     fn vm_receive_memory_fd(
         socket: &mut SocketStream,
@@ -1438,6 +1450,7 @@ impl Vmm {
         ctx: &mut MemoryMigrationContext,
         is_converged: impl Fn(&MemoryMigrationContext) -> result::Result<bool, MigratableError>,
         mem_send: &mut SendAdditionalConnections,
+        postponed_lifecycle_event: &Mutex<Option<PostponedLifecycleEvent>>,
     ) -> result::Result<MemoryRangeTable /* remaining */, MigratableError> {
         loop {
             let iteration_begin = Instant::now();
@@ -1475,6 +1488,16 @@ impl Vmm {
             // Increment iteration last: This way we ensure that the logging
             // above matches the actual iteration.
             ctx.iteration += 1;
+
+            let event = *postponed_lifecycle_event.lock().unwrap();
+            if let Some(event) = event {
+                info!(
+                    "Lifecycle event postponed during migration ({event:?}), switching to downtime phase early"
+                );
+                // The current iteration has already been sent, therefore no extra range
+                // needs to be carried into the final transfer batch.
+                break Ok(MemoryRangeTable::default());
+            }
         }
     }
 
@@ -1584,6 +1607,7 @@ impl Vmm {
         send_data_migration: &VmSendMigrationData,
         mem_send: &mut SendAdditionalConnections,
         ctx: &mut OngoingMigrationContext,
+        postponed_lifecycle_event: &Mutex<Option<PostponedLifecycleEvent>>,
     ) -> result::Result<(), MigratableError> {
         let mut mem_ctx = MemoryMigrationContext::new();
 
@@ -1595,6 +1619,7 @@ impl Vmm {
             // We bind send_data_migration to the callback
             |ctx| Self::is_precopy_converged(ctx, send_data_migration),
             mem_send,
+            postponed_lifecycle_event,
         )?;
         let downtime_begin = Instant::now();
         if vm.get_state() != VmState::Paused {
@@ -1748,6 +1773,7 @@ impl Vmm {
                 send_data_migration,
                 &mut mem_send,
                 &mut ctx,
+                postponed_lifecycle_event,
             )
             .inspect_err(|_| {
                 // Calling cleanup multiple times is fine, thus here we just make sure
@@ -2109,6 +2135,8 @@ impl Vmm {
             });
 
             self.vm = VmOwnership::Owned(vm);
+
+            self.replay_postponed_lifecycle_event();
         };
 
         match migration_res {
@@ -2138,6 +2166,7 @@ impl Vmm {
                 try_resume_vm_after_failed_migration(vm);
             }
         }
+        self.clear_postponed_lifecycle_event();
     }
 
     fn control_loop(
