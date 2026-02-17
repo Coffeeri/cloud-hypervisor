@@ -13,9 +13,8 @@
 //! [`MigrationWorkerSpawnError`].
 
 use std::fmt::{self, Debug, Formatter};
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::{io, thread};
 
@@ -28,7 +27,7 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::Vmm;
 use crate::api::VmSendMigrationData;
-use crate::vm::{Vm, VmState};
+use crate::vm::{PostponedLifecycleEvent, Vm, VmState};
 
 #[derive(thiserror::Error)]
 #[error("Migration worker could not be spawned: {spawn_error}")]
@@ -85,6 +84,7 @@ pub struct MigrationWorker {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     initial_vm_state: VmState,
     seccomp_filters: MigrationSeccompFilters,
+    postponed_lifecycle_event: Arc<Mutex<Option<PostponedLifecycleEvent>>>,
 }
 
 impl MigrationWorker {
@@ -115,6 +115,7 @@ impl MigrationWorker {
                     &self.config,
                     self.initial_vm_state,
                     &self.seccomp_filters,
+                    self.postponed_lifecycle_event.as_ref(),
                 )
             })
             .inspect(|_| event!("vm", "migration-finished"))
@@ -144,6 +145,7 @@ impl MigrationWorker {
         >,
         initial_vm_state: VmState,
         seccomp_filters: MigrationSeccompFilters,
+        postponed_lifecycle_event: Arc<Mutex<Option<PostponedLifecycleEvent>>>,
     ) -> Result<MigrationWorkerHandle, MigrationWorkerSpawnError> {
         let (vm_sender, vm_receiver) = mpsc::sync_channel(0);
         let worker = MigrationWorker {
@@ -154,6 +156,7 @@ impl MigrationWorker {
             hypervisor,
             initial_vm_state,
             seccomp_filters,
+            postponed_lifecycle_event,
         };
 
         let inner_handle = match thread::Builder::new()
