@@ -1029,6 +1029,11 @@ impl VirtioDevice for Block {
         self.update_writeback();
 
         let mut epoll_threads = Vec::new();
+        let queue_thread_count = queues.len();
+        // Pause waits for the main VMM thread and each spawned block queue
+        // thread.
+        let pause_barrier_parties = 1 + queue_thread_count;
+        self.common.paused_sync = Some(Arc::new(Barrier::new(pause_barrier_parties)));
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
 
         for i in 0..queues.len() {
