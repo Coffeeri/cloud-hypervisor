@@ -16,7 +16,7 @@ use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{io, result};
 
@@ -181,6 +181,14 @@ fn dup_stdout() -> vmm_sys_util::errno::Result<File> {
     Ok(unsafe { File::from_raw_fd(stdout) })
 }
 
+fn open_serial_output_file(path: &Path) -> ConsoleDeviceResult<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(ConsoleDeviceError::CreateConsoleDevice)
+}
+
 pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<ConsoleInfo> {
     let vm_config = vmm.vm_config.as_mut().unwrap().clone();
     let mut vmconfig = vm_config.lock().unwrap();
@@ -238,11 +246,9 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
             ConsoleOutputMode::Off => ConsoleOutput::Off,
         },
         serial_main_fd: match vmconfig.serial.mode {
-            ConsoleOutputMode::File => {
-                let file = File::create(vmconfig.serial.file.as_ref().unwrap())
-                    .map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                ConsoleOutput::File(Arc::new(file))
-            }
+            ConsoleOutputMode::File => ConsoleOutput::File(Arc::new(open_serial_output_file(
+                vmconfig.serial.file.as_ref().unwrap(),
+            )?)),
             ConsoleOutputMode::Pty => {
                 let (main_fd, sub_fd, path) =
                     create_pty().map_err(ConsoleDeviceError::CreateConsoleDevice)?;
@@ -281,8 +287,7 @@ pub(crate) fn pre_create_console_devices(vmm: &mut Vmm) -> ConsoleDeviceResult<C
 
                 let mut f = None;
                 if let Some(p) = &vmconfig.serial.file {
-                    let file = File::create(p).map_err(ConsoleDeviceError::CreateConsoleDevice)?;
-                    f = Some(Arc::new(file));
+                    f = Some(Arc::new(open_serial_output_file(p)?));
                 }
                 ConsoleOutput::Tcp(Arc::new(listener), f)
             }
