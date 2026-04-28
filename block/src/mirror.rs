@@ -9,7 +9,7 @@
 //! both sides are in sync the device manager can complete the mirror,
 //! switching the device to serve I/O from the destination.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -18,7 +18,7 @@ use log::warn;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::BatchRequest;
-use crate::async_io::{AsyncIo, AsyncIoResult};
+use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
 
 /// Serializes overlapping byte ranges between the copy worker and the
 /// per-queue mirror writes.
@@ -27,7 +27,6 @@ use crate::async_io::{AsyncIo, AsyncIoResult};
 /// holds the returned [`RangeGuard`] until completion. A conflicting
 /// request blocks on a `Condvar` until the held guard is dropped.
 /// Lookups are O(log n) on the number of held ranges.
-#[allow(dead_code)]
 struct RangeLockManager {
     /// Held ranges as `start -> end_exclusive`. The mutex makes the
     /// overlap check and insert in [`Self::lock_range`] atomic with
@@ -37,7 +36,6 @@ struct RangeLockManager {
     cv: Condvar,
 }
 
-#[allow(dead_code)]
 impl RangeLockManager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -95,7 +93,6 @@ impl RangeLockManager {
 
 /// RAII handle for a range held in a [`RangeLockManager`]. Drop
 /// releases the range and wakes all waiters.
-#[allow(dead_code)]
 struct RangeGuard {
     mgr: Arc<RangeLockManager>,
     start: u64,
@@ -132,15 +129,15 @@ pub enum MirrorPhase {
 /// counters.
 pub struct MirrorState {
     /// Current phase of the migration.
-    #[allow(dead_code)]
     phase: Mutex<MirrorPhase>,
+    range_locks: Arc<RangeLockManager>,
 }
 
-#[allow(dead_code)]
 impl MirrorState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             phase: Mutex::new(MirrorPhase::Running),
+            range_locks: RangeLockManager::new(),
         })
     }
 
@@ -195,14 +192,87 @@ impl MirrorState {
     }
 }
 
+/// State for a single inflight mirrored request awaiting source and
+/// destination completions. Drop releases the optional range guard so the
+/// copy worker can touch the range again.
+///
+/// Only mutating requests are tracked, reads are applied to the
+/// `source` disk.
+struct InflightMutatingRequest {
+    src_completion: Option<i32>,
+    dest_completion: Option<i32>,
+    _guard: Option<RangeGuard>,
+}
+impl InflightMutatingRequest {
+    fn new(guard: Option<RangeGuard>) -> Self {
+        Self {
+            src_completion: None,
+            dest_completion: None,
+            _guard: guard,
+        }
+    }
+}
+
 /// Per-queue `AsyncIo` handle for a mirror.
-#[allow(dead_code)]
 pub struct MirroringAsyncIo {
     source: Box<dyn AsyncIo>,
     destination: Box<dyn AsyncIo>,
     state: Arc<MirrorState>,
+    /// Inflight mirrored requests, keyed by the request's `user_data`.
+    /// The optional guard inside each entry blocks the copy worker from touching
+    /// the same range until both completions arrive.
+    inflight_requests: HashMap<u64, InflightMutatingRequest>,
 }
+impl MirroringAsyncIo {
+    /// Fail virtqueue worker and go into passthrough.
+    /// While this keeps the VM and source block-dev state valid, the operator
+    /// needs to cancel to cleanup resources.
+    fn fail(&mut self, reason: String) {
+        self.state.transition_to_phase(MirrorPhase::Failed(reason));
+    }
 
+    /// Helper that applies an `AsyncIo` request to both source and destination,
+    /// tracking it in `inflight_requests` until both complete.
+    ///
+    /// Source error bubbles to the guest. Destination error fails and cancels
+    /// the migration but is hidden from the guest, since `source` is the disk
+    /// the guest sees.
+    /// Tracking is skipped when `user_data` is `None` (fsync barriers that don't
+    /// want a completion notification).
+    fn mirror_request<S, D>(
+        &mut self,
+        request_label: &str,
+        guard: Option<RangeGuard>,
+        user_data: Option<u64>,
+        submit_source: S,
+        submit_destination: D,
+    ) -> AsyncIoResult<()>
+    where
+        S: FnOnce(&mut Box<dyn AsyncIo>) -> AsyncIoResult<()>,
+        D: FnOnce(&mut Box<dyn AsyncIo>) -> AsyncIoResult<()>,
+    {
+        // Source error bubbles to the guest. Drop optional guard via scope exit.
+        submit_source(&mut self.source)?;
+
+        // Destination error fails migration silently.
+        if let Err(e) = submit_destination(&mut self.destination) {
+            self.fail(format!(
+                "destination {request_label} submit failed for user_data {user_data:?}: {e:?}"
+            ));
+
+            return Ok(());
+        }
+
+        // Only track requests where completion is wanted: user_data is set.
+        // E.g. for `fsync()` we not always want to track this.
+        if let Some(user_data) = user_data {
+            self.inflight_requests
+                .insert(user_data, InflightMutatingRequest::new(guard));
+        }
+
+        Ok(())
+    }
+}
 impl AsyncIo for MirroringAsyncIo {
     fn notifier(&self) -> &EventFd {
         self.source.notifier()
@@ -223,23 +293,91 @@ impl AsyncIo for MirroringAsyncIo {
         iovecs: &[iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
-        self.source.write_vectored(offset, iovecs, user_data)
+        let guard = self
+            .state
+            .range_locks
+            .lock_iovecs(offset, iovecs)
+            .map_err(AsyncIoError::WriteVectored)?;
+        self.mirror_request(
+            "write_vectored",
+            Some(guard),
+            Some(user_data),
+            |src| src.write_vectored(offset, iovecs, user_data),
+            |dst| dst.write_vectored(offset, iovecs, user_data),
+        )
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
-        self.source.fsync(user_data)
+        self.mirror_request(
+            "fsync",
+            None, // We dont need a guard here, `fsync()` is not ranged.
+            user_data,
+            |src| src.fsync(user_data),
+            |dst| dst.fsync(user_data),
+        )
     }
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        self.source.punch_hole(offset, length, user_data)
+        let guard = self
+            .state
+            .range_locks
+            .lock_range(offset, length)
+            .map_err(AsyncIoError::PunchHole)?;
+        self.mirror_request(
+            "punch_hole",
+            Some(guard),
+            Some(user_data),
+            |src| src.punch_hole(offset, length, user_data),
+            |dst| dst.punch_hole(offset, length, user_data),
+        )
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        self.source.write_zeroes(offset, length, user_data)
+        let guard = self
+            .state
+            .range_locks
+            .lock_range(offset, length)
+            .map_err(AsyncIoError::WriteZeroes)?;
+        self.mirror_request(
+            "write_zeroes",
+            Some(guard),
+            Some(user_data),
+            |src| src.write_zeroes(offset, length, user_data),
+            |dst| dst.write_zeroes(offset, length, user_data),
+        )
     }
 
     fn next_completed_request(&mut self) -> Option<(u64, i32)> {
-        self.source.next_completed_request()
+        // Drain source completions.
+        while let Some((completion_id, result)) = self.source.next_completed_request() {
+            match self.inflight_requests.get_mut(&completion_id) {
+                Some(inflight_req) => inflight_req.src_completion = Some(result),
+                None => return Some((completion_id, result)), // passthrough read or non-mirrored write completion
+            }
+        }
+
+        // Drain destination completions.
+        while let Some((completion_id, result)) = self.destination.next_completed_request() {
+            if let Some(inflight_req) = self.inflight_requests.get_mut(&completion_id) {
+                inflight_req.dest_completion = Some(result);
+            } else {
+                warn!("Unexpected destination completion for request {completion_id}");
+            }
+        }
+
+        // Respond with the next mirrored completion on source and destination, if any.
+        let (user_data, completed_req) = self
+            .inflight_requests
+            .extract_if(|_, w| w.src_completion.is_some() && w.dest_completion.is_some())
+            .next()?;
+
+        if completed_req.dest_completion.unwrap() < 0 {
+            self.fail(format!(
+                "destination completion with user_data={user_data} failed"
+            ));
+        }
+
+        Some((user_data, completed_req.src_completion.unwrap()))
     }
 
     fn batch_requests_enabled(&self) -> bool {
