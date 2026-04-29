@@ -11,10 +11,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::os::fd::RawFd;
 use std::sync::{Arc, Condvar, Mutex};
 
 use libc::{iovec, off_t};
 use log::warn;
+use vmm_sys_util::epoll;
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::BatchRequest;
@@ -391,6 +393,42 @@ impl AsyncIo for MirroringAsyncIo {
     fn alignment(&self) -> u64 {
         // Stricter alignment wins. Same iovec goes to both backends.
         self.source.alignment().max(self.destination.alignment())
+    }
+}
+
+/// Single-fd `epoll` wrapper. Built once per eventfd and reused for
+/// every `wait()` call so the copy worker doesn't pay setup cost per
+/// block.
+///
+/// `wait()` blocks until the eventfd becomes readable.
+#[allow(dead_code)]
+struct EpollWaiter {
+    epoll: epoll::Epoll,
+}
+
+#[allow(dead_code)]
+impl EpollWaiter {
+    /// Creates a reusable `EpollWaiter` for the given eventfd.
+    fn new(event_fd: RawFd) -> io::Result<Self> {
+        let epoll = epoll::Epoll::new()?;
+        epoll.ctl(
+            epoll::ControlOperation::Add,
+            event_fd,
+            epoll::EpollEvent::new(epoll::EventSet::IN, 0), // We care about `event fd has data to read` only.
+        )?;
+        Ok(Self { epoll })
+    }
+
+    /// Blocks until the event fd becomes readable. Retries on EINTR.
+    fn wait(&self) -> io::Result<()> {
+        let mut events = [epoll::EpollEvent::default(); 1];
+        loop {
+            match self.epoll.wait(-1, &mut events) {
+                Ok(_) => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
