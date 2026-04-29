@@ -15,10 +15,10 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-use std::{io, result, thread};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::{Duration, Instant};
+use std::{io, result, thread};
 
 use anyhow::anyhow;
 use block::async_io::{AsyncIo, AsyncIoError};
@@ -940,6 +940,10 @@ pub struct Block {
     device_status: Arc<AtomicU8>,
     active_request_count: Arc<AtomicUsize>,
     draining_active_requests: Arc<AtomicBool>,
+    /// Per-virtqueue mirror writer-side handles, populated at
+    /// activation. `Block::start_mirror` fills each slot with a
+    /// [`BlockQueueCommand`] and writes the corresponding evt.
+    queue_cmd_senders: Vec<(Arc<Mutex<Option<BlockQueueCommand>>>, EventFd)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1106,6 +1110,7 @@ impl Block {
             device_status: Arc::new(AtomicU8::new(0)),
             active_request_count: Arc::new(AtomicUsize::new(0)),
             draining_active_requests: Arc::new(AtomicBool::new(false)),
+            queue_cmd_senders: Vec::new(),
         })
     }
 
@@ -1356,6 +1361,12 @@ impl VirtioDevice for Block {
         let mut epoll_threads = Vec::new();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
 
+        // Reset and pre-allocate per-virtqueue mirror handoffs. The
+        // writer-side (slot + evt) is kept on `Block`. The receiver-side
+        // is handed to the BlockEpollHandler.
+        self.queue_cmd_senders.clear();
+        self.queue_cmd_senders.reserve(queues.len());
+
         for i in 0..queues.len() {
             let (_, mut queue, queue_evt) = queues.remove(0);
             queue.set_event_idx(event_idx);
@@ -1363,6 +1374,22 @@ impl VirtioDevice for Block {
             let queue_size = queue.size();
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
             let queue_idx = i as u16;
+
+            let queue_command: Arc<Mutex<Option<BlockQueueCommand>>> = Arc::new(Mutex::new(None));
+            let queue_command_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| {
+                error!("failed to create mirror eventfd: {e}");
+                ActivateError::BadActivate
+            })?;
+            let mirror_handler_evt = queue_command_evt.try_clone().map_err(|e| {
+                error!("failed to clone mirror eventfd: {e}");
+                ActivateError::BadActivate
+            })?;
+            let cmd_receiver = BlockQueueCommandReceiver {
+                cmd: Arc::clone(&queue_command),
+                evt: mirror_handler_evt,
+            };
+            self.queue_cmd_senders
+                .push((queue_command, queue_command_evt));
 
             let mut handler = BlockEpollHandler {
                 queue_index: queue_idx,
@@ -1399,7 +1426,7 @@ impl VirtioDevice for Block {
                 disable_sector0_writes: self.disable_sector0_writes,
                 active_request_count: self.active_request_count.clone(),
                 draining_active_requests: self.draining_active_requests.clone(),
-                cmd_receiver: None,
+                cmd_receiver: Some(cmd_receiver),
             };
 
             let paused = self.common.paused.clone();
