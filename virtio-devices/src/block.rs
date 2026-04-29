@@ -795,6 +795,10 @@ pub struct Block {
     disable_sector0_writes: bool,
     lock_granularity_choice: LockGranularityChoice,
     device_status: Arc<AtomicU8>,
+    /// Per-virtqueue mirror writer-side handles, populated at
+    /// activation. `Block::start_mirror` fills each slot with a
+    /// [`MirrorUpdate`] and writes the corresponding evt.
+    mirror_writers: Vec<(Arc<Mutex<Option<MirrorUpdate>>>, EventFd)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -957,6 +961,7 @@ impl Block {
             disable_sector0_writes,
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
+            mirror_writers: Vec::new(),
         })
     }
 
@@ -1179,6 +1184,12 @@ impl VirtioDevice for Block {
         let mut epoll_threads = Vec::new();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
 
+        // Reset and pre-allocate per-virtqueue mirror handoffs. The
+        // writer-side (slot + evt) is kept on `Block`. The receiver-side
+        // is handed to the BlockEpollHandler.
+        self.mirror_writers.clear();
+        self.mirror_writers.reserve(queues.len());
+
         for i in 0..queues.len() {
             let (_, mut queue, queue_evt) = queues.remove(0);
             queue.set_event_idx(event_idx);
@@ -1186,6 +1197,22 @@ impl VirtioDevice for Block {
             let queue_size = queue.size();
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
             let queue_idx = i as u16;
+
+            let mirror_slot: Arc<Mutex<Option<MirrorUpdate>>> = Arc::new(Mutex::new(None));
+            let mirror_writer_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(|e| {
+                error!("failed to create mirror eventfd: {e}");
+                ActivateError::BadActivate
+            })?;
+            let mirror_handler_evt = mirror_writer_evt.try_clone().map_err(|e| {
+                error!("failed to clone mirror eventfd: {e}");
+                ActivateError::BadActivate
+            })?;
+            let mirror_handoff = MirrorHandoff {
+                slot: Arc::clone(&mirror_slot),
+                evt: mirror_handler_evt,
+                current_dest_notifier: None,
+            };
+            self.mirror_writers.push((mirror_slot, mirror_writer_evt));
 
             let mut handler = BlockEpollHandler {
                 queue_index: queue_idx,
@@ -1221,7 +1248,7 @@ impl VirtioDevice for Block {
                 acked_features: self.common.acked_features,
                 disable_sector0_writes: self.disable_sector0_writes,
                 device_status: self.device_status.clone(),
-                mirror: None,
+                mirror: Some(mirror_handoff),
             };
 
             let paused = self.common.paused.clone();
