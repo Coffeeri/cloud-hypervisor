@@ -15,7 +15,7 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -61,6 +61,12 @@ const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New 'wake up' event from the rate limiter
 const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+
+// `MirrorUpdate` available in virtqueue's `MirrorHandoff` slot:
+// swap disk_image and register destination notifier.
+const MIRROR_UPDATE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+// New completion ready on the mirror destination's notifier.
+const MIRROR_DEST_COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
 
 // latency scale, for reduce precision loss in calculate.
 const LATENCY_SCALE: u64 = 10000;
@@ -112,6 +118,35 @@ pub enum Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+/// New AsyncIo and destination notifier for a virtqueue's
+/// [`MirrorHandoff::slot`]. On `MIRROR_UPDATE_EVENT` the worker
+/// replaces its `disk_image` with `async_io` and registers
+/// `dest_notifier` for `MIRROR_DEST_COMPLETION_EVENT`.
+pub struct MirrorUpdate {
+    pub async_io: Box<dyn AsyncIo>,
+    pub dest_notifier: EventFd,
+}
+
+/// Per-virtqueue plumbing for swapping the worker's `disk_image` at
+/// runtime.
+///
+/// One `MirrorHandoff` exists per virtqueue worker. `slot` and `evt`
+/// are shared with the API thread, which fills `slot` from
+/// [`Block::start_mirror`] (or `pivot_mirror`/`cancel_mirror` in the
+/// future) and writes to `evt` to wake the worker.
+pub struct MirrorHandoff {
+    /// Next [`MirrorUpdate`] to apply. Written by the API thread,
+    /// taken by the worker on `MIRROR_UPDATE_EVENT`.
+    pub slot: Arc<Mutex<Option<MirrorUpdate>>>,
+    /// Wakes the worker after `slot` is filled. Fires
+    /// `MIRROR_UPDATE_EVENT` on the worker's epoll set.
+    pub evt: EventFd,
+    /// Destination completion notifier currently registered for
+    /// `MIRROR_DEST_COMPLETION_EVENT`. `None` outside the mirroring
+    /// phase.
+    pub current_dest_notifier: Option<EventFd>,
+}
 
 // latency will be records as microseconds, average latency
 // will be save as scaled value.
@@ -166,6 +201,8 @@ struct BlockEpollHandler {
     acked_features: u64,
     disable_sector0_writes: bool,
     device_status: Arc<AtomicU8>,
+    /// Mirror plumbing for in-place disk_image swap. `None` until a mirror is started.
+    mirror: Option<MirrorHandoff>,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -416,6 +453,21 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
         self.try_signal_used_queue()
     }
 
+    /// Drain a completion notification: process the AsyncIo completion
+    /// queue, signal the used virtqueue, and resume submissions if the
+    /// rate limiter allows.
+    fn drain_completions(&mut self) -> result::Result<(), EpollHelperError> {
+        self.process_queue_complete().map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to process queue (complete): {e:?}"))
+        })?;
+        self.try_signal_used_queue()?;
+        let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
+        if !rate_limit_reached {
+            self.process_queue_submit_and_signal()?;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn find_inflight_request(&mut self, completed_head: u16) -> Result<Request> {
         // This loop neatly handles the fast path where the completions are
@@ -632,6 +684,9 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
         if let Some(rate_limiter) = &self.rate_limiter {
             helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
         }
+        if let Some(m) = &self.mirror {
+            helper.add_event(m.evt.as_raw_fd(), MIRROR_UPDATE_EVENT)?;
+        }
         self.set_queue_thread_affinity();
         helper.run(paused, paused_sync, self)?;
 
@@ -642,7 +697,7 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
 impl EpollHelperHandler for BlockEpollHandler {
     fn handle_event(
         &mut self,
-        _helper: &mut EpollHelper,
+        helper: &mut EpollHelper,
         event: &epoll::Event,
     ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
@@ -664,20 +719,7 @@ impl EpollHelperHandler for BlockEpollHandler {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
                 })?;
 
-                self.process_queue_complete().map_err(|e| {
-                    EpollHelperError::HandleEvent(anyhow!(
-                        "Failed to process queue (complete): {e:?}"
-                    ))
-                })?;
-
-                self.try_signal_used_queue()?;
-
-                let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
-
-                // Process the queue only when the rate limit is not reached
-                if !rate_limit_reached {
-                    self.process_queue_submit_and_signal()?;
-                }
+                self.drain_completions()?;
             }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
@@ -694,6 +736,35 @@ impl EpollHelperHandler for BlockEpollHandler {
                     return Err(EpollHelperError::HandleEvent(anyhow!(
                         "Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled."
                     )));
+                }
+            }
+            MIRROR_UPDATE_EVENT => {
+                // Swap disk_image to the new MirroringAsyncIo and register its
+                // destination notifier as a second completion source.
+                if let Some(m) = &mut self.mirror {
+                    let _ = m.evt.read();
+                    if let Some(update) = m.slot.lock().unwrap().take() {
+                        helper.add_event(
+                            update.dest_notifier.as_raw_fd(),
+                            MIRROR_DEST_COMPLETION_EVENT,
+                        )?;
+                        m.current_dest_notifier = Some(update.dest_notifier);
+                        self.disk_image = update.async_io;
+                    }
+                }
+            }
+            MIRROR_DEST_COMPLETION_EVENT => {
+                // Same as COMPLETION_EVENT but draining the captured dest notifier.
+                if let Some(m) = &self.mirror
+                    && let Some(n) = m.current_dest_notifier.as_ref()
+                {
+                    n.read().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to get mirror destination event: {e:?}"
+                        ))
+                    })?;
+
+                    self.drain_completions()?;
                 }
             }
             _ => {
@@ -1150,6 +1221,7 @@ impl VirtioDevice for Block {
                 acked_features: self.common.acked_features,
                 disable_sector0_writes: self.disable_sector0_writes,
                 device_status: self.device_status.clone(),
+                mirror: None,
             };
 
             let paused = self.common.paused.clone();
