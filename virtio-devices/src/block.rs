@@ -15,7 +15,8 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -61,6 +62,12 @@ const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 const COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New 'wake up' event from the rate limiter
 const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+
+// `BlockQueueCommand` available in virtqueue's `MirrorHandoff` slot:
+// swap disk_image and register destination notifier.
+const BLOCK_COMMAND_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+// New completion ready on the mirror destination's notifier.
+const MIRROR_DEST_COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
 
 // latency scale, for reduce precision loss in calculate.
 const LATENCY_SCALE: u64 = 10000;
@@ -111,9 +118,122 @@ pub enum Error {
     ConfigChange(#[source] io::Error),
     #[error("Disk resize failed")]
     DiskResize(#[source] BlockError),
+    #[error("Failed applying mirror command: {0}")]
+    MirrorSwap(String),
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+/// Lifecycle command kind for a virtqueue worker.
+#[derive(Debug)]
+pub enum BlockQueueCommandKind {
+    /// Replace the plain source backend with a mirroring backend.
+    InstallMirror,
+    /// Replace the mirroring backend with a plain destination backend.
+    CompleteToDestination,
+    /// Replace the mirroring backend with a plain source backend.
+    CancelToSource,
+}
+
+/// Acknowledgement sent by one virtqueue worker after handling a command.
+pub struct BlockQueueAck {
+    /// ID of the command that is being acknowledged.
+    pub op_id: u64,
+    /// Result of applying the command inside the worker.
+    pub result: Result<()>,
+}
+
+/// Command sent from `Block` to one virtqueue worker to change the worker's
+/// active block I/O backend.
+pub struct BlockQueueCommand {
+    /// Unique id for this lifecycle operation, used to match the succeeding acknowledgement.
+    pub op_id: u64,
+    /// Lifecycle action the worker should apply.
+    pub kind: BlockQueueCommandKind,
+    /// New async I/O backend that will replace the worker's current
+    /// `disk_image` after the old backend has drained.
+    ///
+    /// For start this is a `MirroringAsyncIo`. For cancel this is a plain
+    /// source `AsyncIo`. For completion this is a plain destination `AsyncIo`.
+    pub async_io: Box<dyn AsyncIo>,
+
+    /// Optional secondary completion notifier for mirrored destination I/O.
+    ///
+    /// This is `Some` only when installing `MirroringAsyncIo`. It is `None`
+    /// when swapping back to a plain source backend or completing to a plain
+    /// destination backend.
+    pub dest_notifier: Option<EventFd>,
+
+    /// Channel used by the worker to report that the command was applied or
+    /// failed.
+    pub ack: Sender<BlockQueueAck>,
+}
+
+impl BlockQueueCommand {
+    pub fn install_mirror(
+        op_id: u64,
+        async_io: Box<dyn AsyncIo>,
+        dest_notifier: EventFd,
+        ack: Sender<BlockQueueAck>,
+    ) -> Self {
+        BlockQueueCommand {
+            op_id,
+            kind: BlockQueueCommandKind::InstallMirror,
+            async_io,
+            dest_notifier: Some(dest_notifier),
+            ack,
+        }
+    }
+
+    pub fn complete_to_destination(
+        op_id: u64,
+        async_io: Box<dyn AsyncIo>,
+        ack: Sender<BlockQueueAck>,
+    ) -> Self {
+        BlockQueueCommand {
+            op_id,
+            kind: BlockQueueCommandKind::CompleteToDestination,
+            async_io,
+            dest_notifier: None,
+            ack,
+        }
+    }
+
+    /// Cancel mirroring and revert to the original source backend.
+    pub fn cancel_to_source(
+        op_id: u64,
+        async_io: Box<dyn AsyncIo>,
+        ack: Sender<BlockQueueAck>,
+    ) -> Self {
+        BlockQueueCommand {
+            op_id,
+            kind: BlockQueueCommandKind::CancelToSource,
+            async_io,
+            dest_notifier: None,
+            ack,
+        }
+    }
+}
+
+/// Per-virtqueue plumbing for swapping the worker's `disk_image` at
+/// runtime.
+///
+/// One `MirrorHandoff` exists per virtqueue worker. `slot` and `evt`
+/// are shared with the API thread, which fills `slot` from
+/// [`Block::start_mirror`] (or `complete_mirror`/`cancel_mirror` in the
+/// future) and writes to `evt` to wake the worker.
+pub struct BlockQueueCommandReceiver {
+    /// Next [`BlockQueueCommand`] to apply. Written by the API thread,
+    /// taken by the worker on `MIRROR_UPDATE_EVENT`.
+    pub cmd: Arc<Mutex<Option<BlockQueueCommand>>>,
+    /// Wakes the worker after `slot` is filled. Fires
+    /// `MIRROR_UPDATE_EVENT` on the worker's epoll set.
+    pub evt: EventFd,
+    /// Destination completion notifier currently registered for
+    /// `MIRROR_DEST_COMPLETION_EVENT`. `None` outside the mirroring
+    /// phase.
+    pub current_dest_notifier: Option<EventFd>,
+}
 
 // latency will be records as microseconds, average latency
 // will be save as scaled value.
@@ -167,6 +287,8 @@ struct BlockEpollHandler {
     host_cpus: Option<Box<[usize]>>,
     acked_features: u64,
     disable_sector0_writes: bool,
+    /// Receives mirror lifecycle commands for this virtqueue worker.
+    cmd_receiver: Option<BlockQueueCommandReceiver>,
 }
 
 fn has_feature(features: u64, feature_flag: u64) -> bool {
@@ -423,6 +545,111 @@ impl BlockEpollHandler {
         self.try_signal_used_queue()
     }
 
+    /// Drain a completion notification: process the AsyncIo completion
+    /// queue, signal the used virtqueue, and resume submissions if the
+    /// rate limiter allows.
+    fn drain_completions(&mut self) -> result::Result<(), EpollHelperError> {
+        if let Err(e) = self.process_queue_complete() {
+            warn!("Failed to process queue (complete): {e:?}");
+        }
+        self.try_signal_used_queue()?;
+        let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
+        if !rate_limit_reached {
+            self.process_queue_submit_and_signal()?;
+        }
+        Ok(())
+    }
+
+    fn apply_block_queue_command(
+        disk_image: &mut Box<dyn AsyncIo>,
+        current_dest_notifier: &mut Option<EventFd>,
+        command: BlockQueueCommand,
+        helper: &mut EpollHelper,
+    ) -> result::Result<(), Error> {
+        let BlockQueueCommand {
+            op_id: _,
+            kind,
+            async_io: new_disk_image,
+            dest_notifier,
+            ack: _,
+        } = command;
+
+        let new_dest_notifier = match kind {
+            BlockQueueCommandKind::InstallMirror => Some(dest_notifier.ok_or_else(|| {
+                Error::MirrorSwap("InstallMirror missing destination notifier".to_string())
+            })?),
+            BlockQueueCommandKind::CompleteToDestination
+            | BlockQueueCommandKind::CancelToSource => {
+                if dest_notifier.is_some() {
+                    return Err(Error::MirrorSwap(
+                        "plain block queue command carried destination notifier".to_string(),
+                    ));
+                }
+                None
+            }
+        };
+
+        let new_disk_fd = new_disk_image.notifier().as_raw_fd();
+        let old_disk_fd = disk_image.notifier().as_raw_fd();
+        let new_dest_fd = new_dest_notifier.as_ref().map(|e| e.as_raw_fd());
+
+        // Register new async_io completion eventFd.
+        helper
+            .add_event(new_disk_fd, COMPLETION_EVENT)
+            .map_err(|e| {
+                Error::MirrorSwap(format!("Failed to register new disk notifier: {e:?}"))
+            })?;
+
+        // Optionally register the new dest notifier if this command carries one. Completion and cancel won't have one, but install will.
+        if let Some(fd) = new_dest_fd
+            && let Err(e) = helper.add_event(fd, MIRROR_DEST_COMPLETION_EVENT)
+        {
+            // Rollback the new disk_image registration.
+            let _ = helper.del_event_custom(new_disk_fd, COMPLETION_EVENT, epoll::Events::EPOLLIN);
+            return Err(Error::MirrorSwap(format!(
+                "Failed to register new dest notifier: {e:?}"
+            )));
+        }
+
+        // Deregister old async_io completion eventFd.
+        if let Err(e) =
+            helper.del_event_custom(old_disk_fd, COMPLETION_EVENT, epoll::Events::EPOLLIN)
+        {
+            // Rollback the new disk_image registration.
+            let _ = helper.del_event_custom(new_disk_fd, COMPLETION_EVENT, epoll::Events::EPOLLIN);
+
+            // Rollback the new dest_notifier registration if any.
+            if let Some(fd) = new_dest_fd {
+                let _ = helper.del_event_custom(
+                    fd,
+                    MIRROR_DEST_COMPLETION_EVENT,
+                    epoll::Events::EPOLLIN,
+                );
+            }
+            return Err(Error::MirrorSwap(format!(
+                "Failed to deregister old disk notifier: {e:?}"
+            )));
+        }
+
+        let old_dest = current_dest_notifier.take();
+        let old_dest_fd = old_dest.as_ref().map(|e| e.as_raw_fd());
+
+        // Deregister any old dest async_io completion eventFd if any.
+        if let Some(fd) = old_dest_fd {
+            helper
+                .del_event_custom(fd, MIRROR_DEST_COMPLETION_EVENT, epoll::Events::EPOLLIN)
+                .map_err(|e| {
+                    Error::MirrorSwap(format!("Failed to deregister old dest notifier: {e:?}"))
+                })?;
+        }
+
+        // Commit and swap async_io and dest_notifier.
+        *disk_image = new_disk_image;
+        *current_dest_notifier = new_dest_notifier;
+
+        Ok(())
+    }
+
     #[inline]
     fn find_inflight_request(&mut self, completed_head: u16) -> Result<Request> {
         // This loop neatly handles the fast path where the completions are
@@ -638,6 +865,9 @@ impl BlockEpollHandler {
         if let Some(rate_limiter) = &self.rate_limiter {
             helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
         }
+        if let Some(cmd_receiver) = &self.cmd_receiver {
+            helper.add_event(cmd_receiver.evt.as_raw_fd(), BLOCK_COMMAND_EVENT)?;
+        }
         self.set_queue_thread_affinity();
         helper.run(paused, paused_sync, self)?;
 
@@ -648,7 +878,7 @@ impl BlockEpollHandler {
 impl EpollHelperHandler for BlockEpollHandler {
     fn handle_event(
         &mut self,
-        _helper: &mut EpollHelper,
+        helper: &mut EpollHelper,
         event: &epoll::Event,
     ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
@@ -670,18 +900,7 @@ impl EpollHelperHandler for BlockEpollHandler {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
                 })?;
 
-                if let Err(e) = self.process_queue_complete() {
-                    warn!("Failed to process queue (complete): {e:?}");
-                }
-
-                self.try_signal_used_queue()?;
-
-                let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
-
-                // Process the queue only when the rate limit is not reached
-                if !rate_limit_reached {
-                    self.process_queue_submit_and_signal()?;
-                }
+                self.drain_completions()?;
             }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
@@ -698,6 +917,39 @@ impl EpollHelperHandler for BlockEpollHandler {
                     return Err(EpollHelperError::HandleEvent(anyhow!(
                         "Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled."
                     )));
+                }
+            }
+            BLOCK_COMMAND_EVENT => {
+                // Apply a staged command: swap disk_image and re-register notifiers.
+                if let Some(m) = self.cmd_receiver.as_mut() {
+                    let _ = m.evt.read();
+                    if let Some(command) = m.cmd.lock().unwrap().take() {
+                        Self::apply_block_queue_command(
+                            &mut self.disk_image,
+                            &mut m.current_dest_notifier,
+                            command,
+                            helper,
+                        )
+                        .map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Failed to apply block queue command: {e}"
+                            ))
+                        })?;
+                    }
+                }
+            }
+            MIRROR_DEST_COMPLETION_EVENT => {
+                // Same as COMPLETION_EVENT but draining the captured dest notifier.
+                if let Some(m) = &self.cmd_receiver
+                    && let Some(n) = m.current_dest_notifier.as_ref()
+                {
+                    n.read().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to get mirror destination event: {e:?}"
+                        ))
+                    })?;
+
+                    self.drain_completions()?;
                 }
             }
             _ => {
@@ -1155,6 +1407,7 @@ impl VirtioDevice for Block {
                 host_cpus: self.queue_affinity.get(&queue_idx).cloned(),
                 acked_features: self.common.acked_features,
                 disable_sector0_writes: self.disable_sector0_writes,
+                cmd_receiver: None,
             };
 
             let paused = self.common.paused.clone();
