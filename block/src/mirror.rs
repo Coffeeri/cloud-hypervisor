@@ -29,6 +29,10 @@ use crate::disk_file::{
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::{BatchRequest, DiskTopology};
 
+/// Block size for the copy worker, in which it copies data from
+/// source to destination and holds the range lock.
+pub const MIRROR_BLOCK_SIZE: usize = 512 * 1024; // 512 KiB
+
 /// Serializes overlapping byte ranges between the copy worker and the
 /// per-queue mirror writes.
 ///
@@ -234,6 +238,37 @@ impl MirroringDiskFile {
     pub fn state(&self) -> Arc<MirrorState> {
         self.state.clone()
     }
+
+    /// Borrows the source disk.
+    pub fn source(&self) -> &dyn AsyncFullDiskFile {
+        self.source.as_ref()
+    }
+
+    /// Borrows the destination disk.
+    pub fn destination(&self) -> &dyn AsyncFullDiskFile {
+        self.destination.as_ref()
+    }
+
+    /// Builds a [`MirroringAsyncIo`] for one virtqueue. Returns the
+    /// async I/O handle and a clone of the destination's notifier
+    /// eventfd. The caller registers the notifier in its epoll set so
+    /// destination completions wake the worker.
+    pub fn create_mirror_async_io(
+        &self,
+        ring_depth: u32,
+    ) -> BlockResult<(Box<dyn AsyncIo>, EventFd)> {
+        let source_io = self.source.create_async_io(ring_depth)?;
+        let dest_io = self.destination.create_async_io(ring_depth)?;
+        let dest_notifier = dest_io.notifier().try_clone()?;
+        let async_io = Box::new(MirroringAsyncIo {
+            source: source_io,
+            destination: dest_io,
+            state: self.state.clone(),
+            inflight_requests: HashMap::new(),
+        });
+
+        Ok((async_io, dest_notifier))
+    }
 }
 impl AsyncDiskFile for MirroringDiskFile {
     fn try_clone(&self) -> BlockResult<Box<dyn AsyncDiskFile>> {
@@ -241,14 +276,9 @@ impl AsyncDiskFile for MirroringDiskFile {
     }
 
     fn create_async_io(&self, ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
-        let source_io = self.source.create_async_io(ring_depth)?;
-        let destination_io = self.destination.create_async_io(ring_depth)?;
-        Ok(Box::new(MirroringAsyncIo {
-            source: source_io,
-            destination: destination_io,
-            state: self.state.clone(),
-            inflight_requests: HashMap::new(),
-        }))
+        // Trait callers do not need destination notified.
+        let (async_io, _) = self.create_mirror_async_io(ring_depth)?;
+        Ok(async_io)
     }
 }
 impl Debug for MirroringDiskFile {
@@ -677,6 +707,15 @@ impl CopyWorker {
             let _ = io.notifier().read()?;
         }
     }
+}
+
+/// Handle returned by `Block::start_mirror`. The owner (typically the
+/// device manager) keeps it alive for the duration of the mirror to
+/// observe `MirrorState` and to retain the [`CopyWorker`] thread.
+#[allow(dead_code)]
+pub struct BlockMirrorHandle {
+    pub state: Arc<MirrorState>,
+    pub copy_worker: CopyWorkerHandle,
 }
 
 /// Single-fd `epoll` wrapper. Built once per eventfd and reused for
