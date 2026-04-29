@@ -26,6 +26,10 @@ use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
 use crate::disk_file::AsyncFullDiskFile;
 use crate::error::BlockResult;
 
+/// Block size for the copy worker, in which it copies data from
+/// source to destination and holds the range lock.
+pub const MIRROR_BLOCK_SIZE: usize = 512 * 1024; // 512 KiB
+
 /// Serializes overlapping byte ranges between the copy worker and the
 /// per-queue mirror writes.
 ///
@@ -575,6 +579,15 @@ impl CopyWorker {
             let _ = io.notifier().read()?;
         }
     }
+}
+
+/// Handle returned by `Block::start_mirror`. The owner (typically the
+/// device manager) keeps it alive for the duration of the mirror to
+/// observe `MirrorState` and to retain the [`CopyWorker`] thread.
+#[allow(dead_code)]
+pub struct BlockMirrorHandle {
+    pub state: Arc<MirrorState>,
+    pub copy_worker: CopyWorkerHandle,
 }
 
 /// Single-fd `epoll` wrapper. Built once per eventfd and reused for
