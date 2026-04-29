@@ -10,9 +10,11 @@
 //! switching the device to serve I/O from the destination.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::{io, thread};
 
 use libc::{iovec, off_t};
 use log::warn;
@@ -21,6 +23,8 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::BatchRequest;
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
+use crate::disk_file::AsyncFullDiskFile;
+use crate::error::BlockResult;
 
 /// Serializes overlapping byte ranges between the copy worker and the
 /// per-queue mirror writes.
@@ -133,13 +137,17 @@ pub struct MirrorState {
     /// Current phase of the migration.
     phase: Mutex<MirrorPhase>,
     range_locks: Arc<RangeLockManager>,
+    copied_bytes: AtomicU64,
+    total_bytes: u64,
 }
 
 impl MirrorState {
-    pub fn new() -> Arc<Self> {
+    pub fn new(logical_disk_size: u64) -> Arc<Self> {
         Arc::new(Self {
             phase: Mutex::new(MirrorPhase::Running),
             range_locks: RangeLockManager::new(),
+            copied_bytes: AtomicU64::new(0),
+            total_bytes: logical_disk_size,
         })
     }
 
@@ -396,17 +404,188 @@ impl AsyncIo for MirroringAsyncIo {
     }
 }
 
+/// Owns the copy worker thread's [`JoinHandle`]. The thread is joined
+/// when the handle is dropped, or via [`Self::join`].
+pub struct CopyWorkerHandle {
+    join: Option<JoinHandle<()>>,
+}
+
+impl CopyWorkerHandle {
+    /// Waits for the copy worker thread to finish. Idempotent:
+    /// subsequent calls return `Ok(())` without blocking.
+    pub fn join(&mut self) -> thread::Result<()> {
+        if let Some(t) = self.join.take() {
+            return t.join();
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for CopyWorkerHandle {
+    fn drop(&mut self) {
+        self.join().ok();
+    }
+}
+
+/// Background thread that copies existing source bytes to destination
+/// in fixed-size blocks. Holds a [`RangeGuard`] across each block so
+/// the virtqueue mirror writes cannot race the copy.
+pub struct CopyWorker {
+    source_io: Box<dyn AsyncIo>,
+    dest_io: Box<dyn AsyncIo>,
+    state: Arc<MirrorState>,
+    /// Once allocated, the buffer is reused for all blocks to avoid repeated allocations.
+    buf: Vec<u8>,
+    /// Tracks the next user_data for request and completion notifications.
+    next_user_data: u64,
+    source_waiter: EpollWaiter,
+    dest_waiter: EpollWaiter,
+}
+impl CopyWorker {
+    /// Builds a worker on top of two async I/O handles. Queue depth 1
+    /// is enough, as the worker is sequential. The caller must initialize the
+    /// destination disk.
+    ///
+    /// Start the worker thread with [`Self::spawn`].
+    pub fn new(
+        source_disk: &dyn AsyncFullDiskFile,
+        destination_disk: &dyn AsyncFullDiskFile,
+        state: Arc<MirrorState>,
+        block_size_bytes: usize,
+    ) -> BlockResult<Self> {
+        let source_io = source_disk.create_async_io(1)?;
+        let dest_io = destination_disk.create_async_io(1)?;
+        let source_waiter = EpollWaiter::new(source_io.notifier().as_raw_fd())?;
+        let dest_waiter = EpollWaiter::new(dest_io.notifier().as_raw_fd())?;
+
+        Ok(Self {
+            source_io,
+            dest_io,
+            state,
+            buf: vec![0; block_size_bytes],
+            next_user_data: 0,
+            source_waiter,
+            dest_waiter,
+        })
+    }
+
+    /// Spawns the worker on a named thread and returns its handle.
+    /// On error inside the thread, the migration phase transitions
+    /// to [`MirrorPhase::Failed`].
+    pub fn spawn(self) -> io::Result<CopyWorkerHandle> {
+        let state = self.state.clone();
+        let join = thread::Builder::new()
+            .name("blockdev-mirror-copy-worker".into())
+            .spawn(move || {
+                let mut worker = self;
+                if let Err(e) = worker.run() {
+                    state.transition_to_phase(MirrorPhase::Failed(format!(
+                        "Copy worker failed: {e:?}"
+                    )));
+                }
+            })?;
+
+        Ok(CopyWorkerHandle { join: Some(join) })
+    }
+
+    /// Drives the block-by-block copy for predefined [`MirrorState::total_bytes`],
+    /// then transitions the migration phase to [`MirrorPhase::Ready`].
+    fn run(&mut self) -> io::Result<()> {
+        let total_size = self.state.total_bytes;
+        let max_length = self.buf.len() as u64;
+        let mut offset = 0;
+
+        while offset < total_size {
+            let length = max_length.min(total_size - offset) as usize;
+            self.copy_block(offset, length)?;
+            offset += length as u64;
+        }
+
+        self.state.transition_to_phase(MirrorPhase::Ready);
+        Ok(())
+    }
+
+    /// Copies `length` bytes at `offset` from source to destination.
+    ///
+    /// Holds a range lock for the duration so virtqueue mirror writes cannot race
+    /// the copy. Uses `self.buf` for the copy to avoid repeated allocations.
+    fn copy_block(&mut self, offset: u64, length: usize) -> io::Result<()> {
+        let _guard = self.state.range_locks.lock_range(offset, length as u64)?;
+
+        // Create a single iovec for the requested block.
+        let iovecs = [iovec {
+            iov_base: self.buf.as_mut_ptr().cast(),
+            iov_len: length,
+        }];
+
+        // Read from source into buf.
+        self.buf[..length].fill(0);
+        let read_id = self.generate_user_data();
+        self.source_io
+            .read_vectored(offset as off_t, &iovecs, read_id)
+            .map_err(|e| io::Error::other(format!("async io read_vectored failed: {e}")))?;
+        let (user_data, result) =
+            Self::wait_for_completion(&mut self.source_io, &self.source_waiter)?;
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        debug_assert_eq!(user_data, read_id);
+
+        // Write buf to destination.
+        let write_id = self.generate_user_data();
+        self.dest_io
+            .write_vectored(offset as off_t, &iovecs, write_id)
+            .map_err(|e| io::Error::other(format!("async io write_vectored failed: {e}")))?;
+        let (user_data, result) = Self::wait_for_completion(&mut self.dest_io, &self.dest_waiter)?;
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        debug_assert_eq!(user_data, write_id);
+
+        self.state
+            .copied_bytes
+            .fetch_add(length as u64, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Returns the current [`Self::next_user_data`] and increments it, wrapping on overflow.
+    fn generate_user_data(&mut self) -> u64 {
+        let user_data = self.next_user_data;
+        self.next_user_data = self.next_user_data.wrapping_add(1);
+
+        user_data
+    }
+
+    /// Blocks until one completion is available on `io`, then returns it.
+    fn wait_for_completion(
+        io: &mut Box<dyn AsyncIo>,
+        waiter: &EpollWaiter,
+    ) -> io::Result<(u64, i32)> {
+        loop {
+            if let Some(completion) = io.next_completed_request() {
+                return Ok(completion);
+            }
+
+            // We need to poll the eventfd to detect when the next request completes.
+            waiter.wait()?;
+
+            // Drain the evenfd counter so next epoll_wait will not fire immediately on stale signal.
+            let _ = io.notifier().read()?;
+        }
+    }
+}
+
 /// Single-fd `epoll` wrapper. Built once per eventfd and reused for
 /// every `wait()` call so the copy worker doesn't pay setup cost per
 /// block.
 ///
 /// `wait()` blocks until the eventfd becomes readable.
-#[allow(dead_code)]
 struct EpollWaiter {
     epoll: epoll::Epoll,
 }
 
-#[allow(dead_code)]
 impl EpollWaiter {
     /// Creates a reusable `EpollWaiter` for the given eventfd.
     fn new(event_fd: RawFd) -> io::Result<Self> {
