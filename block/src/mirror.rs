@@ -9,6 +9,7 @@
 //! to serve I/O from the destination.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::{Debug, Formatter};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,10 +21,13 @@ use log::{error, warn};
 use vmm_sys_util::epoll;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::BatchRequest;
-use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
-use crate::disk_file::AsyncFullDiskFile;
-use crate::error::BlockResult;
+use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult, BorrowedDiskFd};
+use crate::disk_file::{
+    AsyncDiskFile, AsyncFullDiskFile, DiskFd, DiskFile, DiskSize, Geometry, PhysicalSize,
+    Resizable, SparseCapable,
+};
+use crate::error::{BlockError, BlockErrorKind, BlockResult};
+use crate::{BatchRequest, DiskTopology};
 
 /// Serializes overlapping byte ranges between the copy worker and the
 /// per-queue mirror writes.
@@ -199,7 +203,6 @@ impl MirrorState {
 /// The virtio block device holds this in place of the original
 /// disk file. Each per-queue `AsyncIo` built from it sends writes
 /// to both backends and serves reads from `source`.
-#[allow(dead_code)]
 pub struct MirroringDiskFile {
     /// Disk that backed the device before the mirror started.
     /// Reads continue to come from here.
@@ -210,6 +213,91 @@ pub struct MirroringDiskFile {
     /// Shared with the copy worker and the per-queue I/O wrappers.
     state: Arc<MirrorState>,
 }
+
+impl MirroringDiskFile {
+    /// Creates a new `MirroringDiskFile` pair. The caller is responsible for
+    /// initializing the destination disk.
+    pub fn new(
+        source: Box<dyn AsyncFullDiskFile>,
+        destination: Box<dyn AsyncFullDiskFile>,
+    ) -> BlockResult<Self> {
+        let state = MirrorState::new(source.logical_size()?);
+
+        Ok(Self {
+            source,
+            destination,
+            state,
+        })
+    }
+    /// Returns the current state of the mirror, shared by the copy worker
+    /// and the mirror virtqueues
+    pub fn state(&self) -> Arc<MirrorState> {
+        self.state.clone()
+    }
+}
+impl AsyncDiskFile for MirroringDiskFile {
+    fn try_clone(&self) -> BlockResult<Box<dyn AsyncDiskFile>> {
+        unimplemented!("MirroringDiskFile cannot be cloned, as it is a single handle to two disks")
+    }
+
+    fn create_async_io(&self, ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
+        let source_io = self.source.create_async_io(ring_depth)?;
+        let destination_io = self.destination.create_async_io(ring_depth)?;
+        Ok(Box::new(MirroringAsyncIo {
+            source: source_io,
+            destination: destination_io,
+            state: self.state.clone(),
+            inflight_requests: HashMap::new(),
+        }))
+    }
+}
+impl Debug for MirroringDiskFile {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MirroringDiskFile").finish_non_exhaustive()
+    }
+}
+
+impl DiskSize for MirroringDiskFile {
+    fn logical_size(&self) -> BlockResult<u64> {
+        self.source.logical_size()
+    }
+}
+
+impl Geometry for MirroringDiskFile {
+    fn topology(&self) -> DiskTopology {
+        self.source.topology()
+    }
+}
+
+impl PhysicalSize for MirroringDiskFile {
+    fn physical_size(&self) -> BlockResult<u64> {
+        self.source.physical_size()
+    }
+}
+
+impl DiskFd for MirroringDiskFile {
+    fn fd(&self) -> BorrowedDiskFd<'_> {
+        self.source.fd()
+    }
+}
+
+impl SparseCapable for MirroringDiskFile {
+    fn supports_sparse_operations(&self) -> bool {
+        self.source.supports_sparse_operations()
+    }
+    fn supports_zero_flag(&self) -> bool {
+        self.source.supports_zero_flag()
+    }
+}
+impl Resizable for MirroringDiskFile {
+    fn resize(&mut self, _size: u64) -> BlockResult<()> {
+        // We cannot allow resizing the source disk, since that would
+        // change the initial [`MirrorState::total_bytes`] and break the
+        // copy worker.
+        Err(BlockError::from_kind(BlockErrorKind::UnsupportedFeature))
+    }
+}
+impl DiskFile for MirroringDiskFile {}
 
 /// State for a single inflight mirrored request awaiting source and
 /// destination completions. Drop releases the optional range guard so the
