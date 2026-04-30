@@ -1114,6 +1114,10 @@ impl Block {
             .map_err(Error::ConfigChange)
     }
 
+    pub fn logical_size(&self) -> BlockResult<u64> {
+        self.disk_image.logical_size()
+    }
+
     /// Start mirroring the device's disk to `destination`.
     ///
     /// Each virtqueue worker swaps its `disk_image` to a new

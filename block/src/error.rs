@@ -42,6 +42,8 @@ pub enum BlockErrorKind {
     NotFound,
     /// An internal counter or limit was exceeded.
     Overflow,
+    /// The file already exists, when disk creation was requested.
+    AlreadyExists,
 }
 
 impl Display for BlockErrorKind {
@@ -54,6 +56,7 @@ impl Display for BlockErrorKind {
             Self::OutOfBounds => write!(f, "Out of bounds"),
             Self::NotFound => write!(f, "Not found"),
             Self::Overflow => write!(f, "Overflow"),
+            Self::AlreadyExists => write!(f, "Already exists"),
         }
     }
 }
