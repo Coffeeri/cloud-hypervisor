@@ -47,9 +47,10 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmDiskMirrorStart, VmDiskMirrorStartData, VmNmi, VmPause,
-    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    VmConfig, VmCounters, VmDelete, VmDiskMirrorStart, VmDiskMirrorStartData, VmDiskMirrorState,
+    VmDiskMirrorStateData, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
+    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
+    VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -487,6 +488,32 @@ impl PutHandler for VmDiskMirrorStart {
     }
 }
 impl GetHandler for VmDiskMirrorStart {}
+
+impl PutHandler for VmDiskMirrorState {
+    fn handle_request(
+        &'static self,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+        body: &Option<Body>,
+        _files: Vec<File>,
+    ) -> Result<Option<Body>, HttpError> {
+        let body = body.as_ref().ok_or(HttpError::BadRequest)?;
+        let data: VmDiskMirrorStateData = serde_json::from_slice(body.raw())?;
+
+        self.send(api_notifier, api_sender, data)
+            .map_err(|e| match &e {
+                ApiError::VmDiskMirrorStatus(VmError::DeviceManager(
+                    DeviceManagerError::UnknownDeviceId(_),
+                )) => HttpError::NotFound,
+                ApiError::VmDiskMirrorStatus(VmError::DeviceManager(
+                    DeviceManagerError::BlockMirrorNotActive(_),
+                )) => HttpError::NotFound,
+                _ => HttpError::ApiError(e),
+            })
+    }
+}
+
+impl GetHandler for VmDiskMirrorState {}
 
 impl PutHandler for VmResize {
     fn handle_request(
