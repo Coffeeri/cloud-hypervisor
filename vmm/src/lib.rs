@@ -3512,24 +3512,26 @@ impl RequestHandler for Vmm {
     ) -> result::Result<(), VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        if let Some(ref mut vm) = self.vm {
-            return vm.mirror_disk(&id, &destination_path);
+        match self.vm {
+            MaybeVmOwnership::Vmm(ref mut vm) => vm.mirror_disk(&id, &destination_path),
+            MaybeVmOwnership::Migration(_) => Err(VmError::VmMigrating),
+            MaybeVmOwnership::None => Err(VmError::DiskMirrorStart),
         }
-
-        Err(VmError::DiskMirrorStart)
     }
 
     fn vm_disk_mirror_status(&mut self, id: String) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
-        if let Some(ref vm) = self.vm {
-            let status = vm.mirror_disk_status(&id)?;
-            let response: VmDiskMirrorStateResponse = status.into();
-            let json = serde_json::to_vec(&response).map_err(|_| VmError::DiskMirrorStatus)?;
-            return Ok(Some(json));
+        match self.vm {
+            MaybeVmOwnership::Vmm(ref vm) => {
+                let status = vm.mirror_disk_status(&id)?;
+                let response: VmDiskMirrorStateResponse = status.into();
+                let json = serde_json::to_vec(&response).map_err(|_| VmError::DiskMirrorStatus)?;
+                Ok(Some(json))
+            }
+            MaybeVmOwnership::Migration(_) => Err(VmError::VmMigrating),
+            MaybeVmOwnership::None => Err(VmError::DiskMirrorStatus),
         }
-
-        Err(VmError::DiskMirrorStatus)
     }
 }
 
