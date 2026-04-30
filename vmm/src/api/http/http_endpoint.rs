@@ -47,12 +47,13 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmConfig, VmCounters, VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot,
+    VmConfig, VmCounters, VmDelete, VmDiskMirrorStart, VmDiskMirrorStartData, VmNmi, VmPause,
+    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
+    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
+use crate::device_manager::DeviceManagerError;
 use crate::vm::Error as VmError;
 
 /// Helper module for attaching externally opened FDs to config objects.
@@ -458,6 +459,34 @@ impl PutHandler for VmAddNet {
 }
 
 impl GetHandler for VmAddNet {}
+
+impl PutHandler for VmDiskMirrorStart {
+    fn handle_request(
+        &'static self,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+        body: &Option<Body>,
+        _files: Vec<File>,
+    ) -> Result<Option<Body>, HttpError> {
+        let body = body.as_ref().ok_or(HttpError::BadRequest)?;
+        let data: VmDiskMirrorStartData = serde_json::from_slice(body.raw())?;
+
+        self.send(api_notifier, api_sender, data)
+            .map_err(|e| match &e {
+                ApiError::VmDiskMirrorStart(VmError::DeviceManager(
+                    DeviceManagerError::UnknownDeviceId(_),
+                )) => HttpError::NotFound,
+                ApiError::VmDiskMirrorStart(VmError::DeviceManager(
+                    DeviceManagerError::BlockMirrorDestAlreadyExists(_, _),
+                )) => HttpError::BadRequest,
+                ApiError::VmDiskMirrorStart(VmError::DeviceManager(
+                    DeviceManagerError::BlockMirrorAlreadyActive(_),
+                )) => HttpError::BadRequest,
+                _ => HttpError::ApiError(e),
+            })
+    }
+}
+impl GetHandler for VmDiskMirrorStart {}
 
 impl PutHandler for VmResize {
     fn handle_request(

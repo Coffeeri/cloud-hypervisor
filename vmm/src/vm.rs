@@ -19,6 +19,7 @@ use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
@@ -34,6 +35,7 @@ use arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY;
 #[cfg(feature = "tdx")]
 use arch::x86_64::tdx::TdvfSection;
 use arch::{EntryPoint, NumaNode, NumaNodes, get_host_cpu_phys_bits};
+use block::mirror::MirrorStatus;
 use devices::AcpiNotificationFlags;
 #[cfg(target_arch = "aarch64")]
 use devices::interrupt_controller;
@@ -266,6 +268,9 @@ pub enum Error {
 
     #[error("Failed resizing a disk image")]
     ResizeDisk,
+
+    #[error("Failed to start disk mirror")]
+    DiskMirrorStart,
 
     #[error("Cannot activate virtio devices")]
     ActivateVirtioDevices(#[source] DeviceManagerError),
@@ -3232,6 +3237,23 @@ impl Vm {
             .unwrap()
             .nmi()
             .map_err(Error::ErrorNmi);
+    }
+    pub fn mirror_disk(&self, id: &str, dest_path: &Path) -> Result<()> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .mirror_disk(id, dest_path)
+            .map_err(Error::DeviceManager)?;
+
+        Ok(())
+    }
+
+    pub fn mirror_disk_status(&self, id: &str) -> Result<MirrorStatus> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .mirror_disk_status(id)
+            .map_err(Error::DeviceManager)
     }
 }
 
