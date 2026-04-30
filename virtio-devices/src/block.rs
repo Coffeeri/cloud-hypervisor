@@ -21,8 +21,11 @@ use std::{io, result};
 use anyhow::anyhow;
 use block::async_io::{AsyncIo, AsyncIoError};
 use block::disk_file::AsyncFullDiskFile;
-use block::error::BlockError;
+use block::error::{BlockError, BlockErrorKind, BlockResult};
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
+use block::mirror::{
+    BlockMirrorHandle, CopyWorker, MIRROR_BLOCK_SIZE, MirrorState, MirroringAsyncIo,
+};
 use block::{
     ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
     VirtioBlockConfig, build_serial, fcntl,
@@ -146,6 +149,12 @@ pub struct MirrorHandoff {
     /// `MIRROR_DEST_COMPLETION_EVENT`. `None` outside the mirroring
     /// phase.
     pub current_dest_notifier: Option<EventFd>,
+}
+
+struct MirrorWriter {
+    slot: Arc<Mutex<Option<MirrorUpdate>>>,
+    evt: EventFd,
+    queue_size: u16,
 }
 
 // latency will be records as microseconds, average latency
@@ -798,7 +807,7 @@ pub struct Block {
     /// Per-virtqueue mirror writer-side handles, populated at
     /// activation. `Block::start_mirror` fills each slot with a
     /// [`MirrorUpdate`] and writes the corresponding evt.
-    mirror_writers: Vec<(Arc<Mutex<Option<MirrorUpdate>>>, EventFd)>,
+    mirror_writers: Vec<MirrorWriter>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1103,6 +1112,66 @@ impl Block {
             .map_err(Error::ConfigChange)
     }
 
+    /// Start mirroring the device's disk to `destination`.
+    ///
+    /// Each virtqueue worker swaps its `disk_image` to a new
+    /// [`MirroringAsyncIo`] that fans every mutating request out to both
+    /// backends. A background [`CopyWorker`] copies existing source bytes
+    /// to destination until all initial bytes are copied.
+    /// The [`MirroringAsyncIo`] stays in place until `pivot`, keeping the device's
+    /// disk and `destination` in sync.
+    ///
+    /// Returns an error on `logical_size()` failure, [`MirroringAsyncIo`]
+    /// construction failure, or copy worker spawn failure.
+    pub fn start_mirror(
+        &self,
+        destination: Box<dyn AsyncFullDiskFile>,
+    ) -> BlockResult<BlockMirrorHandle> {
+        let state = MirrorState::new(self.disk_image.logical_size()?);
+
+        // Pre-build all per-virtqueue updates before installing any. A failure
+        // in MirroringAsyncIo::create then leaves the device unchanged.
+        let mut updates = Vec::with_capacity(self.mirror_writers.len());
+        for mirror_writer in &self.mirror_writers {
+            let (async_io, dest_notifier) = MirroringAsyncIo::create(
+                self.disk_image.as_ref(),
+                destination.as_ref(),
+                state.clone(),
+                mirror_writer.queue_size as u32,
+            )?;
+            updates.push((
+                mirror_writer,
+                MirrorUpdate {
+                    async_io,
+                    dest_notifier,
+                },
+            ));
+        }
+
+        // Spawn a background copy worker before installing any MirroringAsyncIo, leaving
+        // the device unchanged on error.
+        let copy_worker = CopyWorker::new(
+            self.disk_image.as_ref(),
+            destination.as_ref(),
+            state.clone(),
+            MIRROR_BLOCK_SIZE,
+        )?
+        .spawn()
+        .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
+
+        // Install for each disk virtqueue the mirroring asyncIo by firing the `MIRROR_UPDATE_EVENT`.
+        for (mirror_writer, update) in updates {
+            *mirror_writer.slot.lock().unwrap() = Some(update);
+            mirror_writer.evt.write(1)?;
+        }
+
+        Ok(BlockMirrorHandle {
+            state,
+            copy_worker,
+            destination,
+        })
+    }
+
     #[cfg(fuzzing)]
     pub fn wait_for_epoll_threads(&mut self) {
         self.common.wait_for_epoll_threads();
@@ -1212,7 +1281,11 @@ impl VirtioDevice for Block {
                 evt: mirror_handler_evt,
                 current_dest_notifier: None,
             };
-            self.mirror_writers.push((mirror_slot, mirror_writer_evt));
+            self.mirror_writers.push(MirrorWriter {
+                slot: mirror_slot,
+                evt: mirror_writer_evt,
+                queue_size,
+            });
 
             let mut handler = BlockEpollHandler {
                 queue_index: queue_idx,
