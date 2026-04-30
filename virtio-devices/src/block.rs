@@ -24,7 +24,7 @@ use block::disk_file::AsyncFullDiskFile;
 use block::error::{BlockError, BlockErrorKind, BlockResult};
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::mirror::{
-    BlockMirrorHandle, CopyWorker, MIRROR_BLOCK_SIZE, MirrorState, MirroringAsyncIo,
+    BlockMirrorHandle, CopyWorker, MIRROR_BLOCK_SIZE, MirrorState, MirrorStatus, MirroringAsyncIo,
 };
 use block::{
     ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
@@ -814,6 +814,7 @@ pub struct Block {
     /// activation. `Block::start_mirror` fills each slot with a
     /// [`MirrorUpdate`] and writes the corresponding evt.
     mirror_writers: Vec<MirrorWriter>,
+    mirror_handle: Option<BlockMirrorHandle>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -977,6 +978,7 @@ impl Block {
             lock_granularity_choice: lock_granularity,
             device_status: Arc::new(AtomicU8::new(0)),
             mirror_writers: Vec::new(),
+            mirror_handle: None,
         })
     }
 
@@ -1129,10 +1131,7 @@ impl Block {
     ///
     /// Returns an error on `logical_size()` failure, [`MirroringAsyncIo`]
     /// construction failure, or copy worker spawn failure.
-    pub fn start_mirror(
-        &self,
-        destination: Box<dyn AsyncFullDiskFile>,
-    ) -> BlockResult<BlockMirrorHandle> {
+    pub fn start_mirror(&mut self, destination: Box<dyn AsyncFullDiskFile>) -> BlockResult<()> {
         let state = MirrorState::new(self.disk_image.logical_size()?);
 
         // Pre-build all per-virtqueue updates before installing any. A failure
@@ -1171,11 +1170,17 @@ impl Block {
             mirror_writer.evt.write(1)?;
         }
 
-        Ok(BlockMirrorHandle {
+        self.mirror_handle = Some(BlockMirrorHandle {
             state,
             copy_worker,
             destination,
-        })
+        });
+        Ok(())
+    }
+
+    /// Returns a snapshot of the current mirror progress.
+    pub fn mirror_status(&self) -> Option<MirrorStatus> {
+        self.mirror_handle.as_ref().map(|h| h.state.status())
     }
 
     #[cfg(fuzzing)]
