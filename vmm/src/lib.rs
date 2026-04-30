@@ -62,8 +62,8 @@ use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
-    ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmInfoResponse,
-    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    ApiRequest, ApiResponse, RequestHandler, TimeoutStrategy, VmDiskMirrorStateResponse,
+    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -3517,6 +3517,19 @@ impl RequestHandler for Vmm {
         }
 
         Err(VmError::DiskMirrorStart)
+    }
+
+    fn vm_disk_mirror_status(&mut self, id: String) -> result::Result<Option<Vec<u8>>, VmError> {
+        self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        if let Some(ref vm) = self.vm {
+            let status = vm.mirror_disk_status(&id)?;
+            let response: VmDiskMirrorStateResponse = status.into();
+            let json = serde_json::to_vec(&response).map_err(|_| VmError::DiskMirrorStatus)?;
+            return Ok(Some(json));
+        }
+
+        Err(VmError::DiskMirrorStatus)
     }
 }
 
