@@ -40,6 +40,7 @@ use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
 use std::time::Duration;
 
+use block::mirror::MirrorPhase;
 use log::{info, trace};
 use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle};
@@ -153,6 +154,9 @@ pub enum ApiError {
     #[error("Error starting disk mirror")]
     VmDiskMirrorStart(#[source] VmError),
 
+    #[error("Error reading disk mirror state")]
+    VmDiskMirrorStatus(#[source] VmError),
+
     /// The memory zone could not be resized.
     #[error("The memory zone could not be resized")]
     VmResizeZone(#[source] VmError),
@@ -243,6 +247,39 @@ pub struct VmInfoResponse {
 pub struct VmDiskMirrorStartData {
     pub id: String,
     pub destination_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VmDiskMirrorStatusData {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct VmDiskMirrorStatusResponse {
+    pub phase: String, // "running" | "ready" | "completing" | "completed" | "cancelling" | "failed"
+    pub copied_bytes: u64,
+    pub total_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+impl From<block::mirror::MirrorStatus> for VmDiskMirrorStatusResponse {
+    fn from(s: block::mirror::MirrorStatus) -> Self {
+        let (phase, failure) = match s.phase {
+            MirrorPhase::Running => ("running".to_owned(), None),
+            MirrorPhase::Ready => ("ready".to_owned(), None),
+            MirrorPhase::Cancelling => ("cancelling".to_owned(), None),
+            MirrorPhase::Failed(reason) => ("failed".to_owned(), Some(reason)),
+            MirrorPhase::Completing => ("completing".to_owned(), None),
+            MirrorPhase::Completed => ("completed".to_owned(), None),
+        };
+        Self {
+            phase,
+            copied_bytes: s.copied_bytes,
+            total_bytes: s.total_bytes,
+            failure,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -767,6 +804,8 @@ pub trait RequestHandler {
         id: String,
         destination_path: PathBuf,
     ) -> Result<(), VmError>;
+
+    fn vm_disk_mirror_status(&mut self, id: String) -> Result<Option<Vec<u8>>, VmError>;
 
     fn vm_add_device(&mut self, device_cfg: DeviceConfig) -> Result<Option<Vec<u8>>, VmError>;
 
@@ -1410,6 +1449,35 @@ impl ApiAction for VmDiskMirrorStart {
                 .send(response)
                 .map_err(VmmError::ApiResponseSend)?;
 
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmDiskMirrorStatus;
+impl ApiAction for VmDiskMirrorStatus {
+    type RequestBody = VmDiskMirrorStatusData;
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, data: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            let response = vmm
+                .vm_disk_mirror_status(data.id)
+                .map_err(ApiError::VmDiskMirrorStatus)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
             Ok(false)
         })
     }
