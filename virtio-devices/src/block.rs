@@ -15,16 +15,22 @@ use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 use std::{io, result, thread};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use block::async_io::{AsyncIo, AsyncIoError};
 use block::disk_file::AsyncFullDiskFile;
-use block::error::BlockError;
+use block::error::{BlockError, BlockErrorKind, BlockResult};
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
+use block::mirror::{
+    BlockMirrorHandle, CopyWorker, CopyWorkerHandle, MIRROR_BLOCK_SIZE, MirrorPhase, MirrorState,
+    MirroringAsyncIo,
+};
 use block::{
     ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
     VirtioBlockConfig, build_serial, fcntl,
@@ -66,6 +72,9 @@ const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 
 // A `BlockQueueCommand` has been queued for this worker to apply (e.g. swap disk_image).
 const BLOCK_COMMAND_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+
+// Maximum duration to wait for a command to be acknowledged by the virtqueue worker.
+const MIRROR_COMMAND_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 // latency scale, for reduce precision loss in calculate.
 const LATENCY_SCALE: u64 = 10000;
@@ -218,6 +227,12 @@ pub struct BlockQueueCommandReceiver {
     /// Wakes the worker after `cmd` is filled. Fires `BLOCK_COMMAND_EVENT`
     /// on the worker's epoll set.
     pub evt: EventFd,
+}
+
+struct BlockQueueCommandSender {
+    cmd: Arc<Mutex<Option<BlockQueueCommand>>>,
+    evt: EventFd,
+    queue_size: u16,
 }
 
 // latency will be records as microseconds, average latency
@@ -943,7 +958,8 @@ pub struct Block {
     /// Per-virtqueue mirror writer-side handles, populated at
     /// activation. `Block::start_mirror` fills each slot with a
     /// [`BlockQueueCommand`] and writes the corresponding evt.
-    queue_cmd_senders: Vec<(Arc<Mutex<Option<BlockQueueCommand>>>, EventFd)>,
+    queue_cmd_senders: Vec<BlockQueueCommandSender>,
+    next_queue_cmd_op_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1111,6 +1127,7 @@ impl Block {
             active_request_count: Arc::new(AtomicUsize::new(0)),
             draining_active_requests: Arc::new(AtomicBool::new(false)),
             queue_cmd_senders: Vec::new(),
+            next_queue_cmd_op_id: 1,
         })
     }
 
@@ -1280,6 +1297,151 @@ impl Block {
             .map_err(Error::ConfigChange)
     }
 
+    /// Start mirroring the device's disk to `destination`.
+    ///
+    /// Each virtqueue worker swaps its `disk_image` to a new
+    /// [`MirroringAsyncIo`] that fans every mutating request out to both
+    /// backends. A background [`CopyWorker`] copies existing source bytes
+    /// to destination until all initial bytes are copied.
+    /// The [`MirroringAsyncIo`] stays in place until completion, keeping the device's
+    /// disk and `destination` in sync.
+    ///
+    /// Returns an error on `logical_size()` failure, [`MirroringAsyncIo`]
+    /// construction failure, or copy worker spawn failure.
+    pub fn start_mirror(
+        &mut self,
+        destination: Box<dyn AsyncFullDiskFile>,
+    ) -> BlockResult<BlockMirrorHandle> {
+        let state = MirrorState::new(self.disk_image.logical_size()?);
+        let op_id = self.next_mirror_op_id();
+        let (ack_tx, ack_rx) = mpsc::channel();
+
+        let mut commands = Vec::with_capacity(self.queue_cmd_senders.len());
+        for sender in &self.queue_cmd_senders {
+            let async_io = MirroringAsyncIo::create(
+                self.disk_image.as_ref(),
+                destination.as_ref(),
+                state.clone(),
+                sender.queue_size as u32,
+            )?;
+            commands.push((
+                sender,
+                BlockQueueCommand::install_mirror(op_id, async_io, ack_tx.clone()),
+            ));
+        }
+
+        drop(ack_tx);
+
+        let install_result: BlockResult<CopyWorkerHandle> = (|| {
+            Self::send_mirror_queue_commands(commands)?;
+            Self::wait_for_mirror_queue_command_acks(op_id, &ack_rx, self.queue_cmd_senders.len())?;
+            CopyWorker::new(
+                self.disk_image.as_ref(),
+                destination.as_ref(),
+                state.clone(),
+                MIRROR_BLOCK_SIZE,
+            )?
+            .spawn()
+            .map_err(|e| BlockError::new(BlockErrorKind::Io, e))
+        })();
+
+        let copy_worker = match install_result {
+            Ok(worker) => worker,
+            Err(e) => {
+                state.transition_to_phase(MirrorPhase::Failed(format!(
+                    "mirror install failed: {e}"
+                )));
+
+                // Don't mask the install error on revert err.
+                if let Err(revert_err) = self.revert_queues_to_source() {
+                    error!(
+                        "failed to revert virtqueues to source after mirror install failure: {revert_err}"
+                    );
+                }
+                return Err(e);
+            }
+        };
+
+        Ok(BlockMirrorHandle {
+            state,
+            copy_worker,
+            destination,
+        })
+    }
+
+    fn next_mirror_op_id(&mut self) -> u64 {
+        let op_id = self.next_queue_cmd_op_id;
+        self.next_queue_cmd_op_id = self.next_queue_cmd_op_id.wrapping_add(1);
+        op_id
+    }
+
+    fn mirror_swap_error(msg: impl Into<String>) -> BlockError {
+        BlockError::new(BlockErrorKind::MirrorSwap, io::Error::other(msg.into()))
+    }
+
+    fn send_mirror_queue_commands(
+        commands: Vec<(&BlockQueueCommandSender, BlockQueueCommand)>,
+    ) -> BlockResult<()> {
+        for (sender, command) in commands {
+            let mut slot = sender.cmd.lock().unwrap();
+
+            if slot.is_some() {
+                return Err(Self::mirror_swap_error("mirror command slot is occupied"));
+            }
+
+            *slot = Some(command);
+            sender.evt.write(1).map_err(|e| {
+                Self::mirror_swap_error(format!("failed to notify mirror queue worker: {e}"))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Wait for n acknowledgments of a mirror command with the given op_id on ack_rx, returning
+    /// an error if a timeout occurs or if any ack reports an error or mismatched op_id.
+    fn wait_for_mirror_queue_command_acks(
+        op_id: u64,
+        ack_rx: &Receiver<BlockQueueAck>,
+        expected_acks: usize,
+    ) -> BlockResult<()> {
+        for _ in 0..expected_acks {
+            let ack = ack_rx
+                .recv_timeout(MIRROR_COMMAND_ACK_TIMEOUT)
+                .map_err(|e| Self::mirror_swap_error(format!("mirror command ack timeout: {e}")))?;
+
+            if ack.op_id != op_id {
+                return Err(Self::mirror_swap_error(format!(
+                    "received mirror command ack for op_id {}, expected {}",
+                    ack.op_id, op_id
+                )));
+            }
+
+            ack.result.map_err(|e| {
+                Self::mirror_swap_error(format!("mirror command failed in queue worker: {e}"))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Swap every virtqueue worker back to a plain AsyncIo on the source disk.
+    fn revert_queues_to_source(&mut self) -> BlockResult<()> {
+        let op_id = self.next_mirror_op_id();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let mut commands = Vec::with_capacity(self.queue_cmd_senders.len());
+        for sender in &self.queue_cmd_senders {
+            let async_io = self.disk_image.create_async_io(sender.queue_size as u32)?;
+            commands.push((
+                sender,
+                BlockQueueCommand::cancel_to_source(op_id, async_io, ack_tx.clone()),
+            ));
+        }
+        drop(ack_tx);
+        Self::send_mirror_queue_commands(commands)?;
+        Self::wait_for_mirror_queue_command_acks(op_id, &ack_rx, self.queue_cmd_senders.len())
+    }
+
     #[cfg(fuzzing)]
     pub fn wait_for_epoll_threads(&mut self) {
         self.common.wait_for_epoll_threads();
@@ -1388,8 +1550,11 @@ impl VirtioDevice for Block {
                 cmd: Arc::clone(&queue_command),
                 evt: mirror_handler_evt,
             };
-            self.queue_cmd_senders
-                .push((queue_command, queue_command_evt));
+            self.queue_cmd_senders.push(BlockQueueCommandSender {
+                cmd: queue_command,
+                evt: queue_command_evt,
+                queue_size,
+            });
 
             let mut handler = BlockEpollHandler {
                 queue_index: queue_idx,
