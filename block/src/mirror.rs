@@ -21,10 +21,10 @@ use log::warn;
 use vmm_sys_util::epoll;
 use vmm_sys_util::eventfd::EventFd;
 
-use crate::BatchRequest;
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
 use crate::disk_file::AsyncFullDiskFile;
 use crate::error::BlockResult;
+use crate::{BatchRequest, RequestType};
 
 /// Block size for the copy worker, in which it copies data from
 /// source to destination and holds the range lock.
@@ -433,11 +433,18 @@ impl AsyncIo for MirroringAsyncIo {
     }
 
     fn batch_requests_enabled(&self) -> bool {
-        false
+        true
     }
 
-    fn submit_batch_requests(&mut self, _batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
-        unimplemented!("Batch requests are not supported in MirroringAsyncIo")
+    fn submit_batch_requests(&mut self, batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
+        for req in batch_request {
+            match req.request_type {
+                RequestType::In => self.read_vectored(req.offset, &req.iovecs, req.user_data)?,
+                RequestType::Out => self.write_vectored(req.offset, &req.iovecs, req.user_data)?,
+                _ => unreachable!("Unexpected batch request type: {:?}", req.request_type),
+            }
+        }
+        Ok(())
     }
 
     fn alignment(&self) -> u64 {
