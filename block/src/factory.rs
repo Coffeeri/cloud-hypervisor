@@ -203,6 +203,47 @@ fn open_qcow2(
     ))
 }
 
+/// Create a new disk image at `options.path` of the given image type
+/// and logical `size`. The file must not exist yet.
+pub fn create_disk(
+    options: &DiskOpenOptions<'_>,
+    image_type: ImageType,
+    size: u64,
+) -> BlockResult<()> {
+    if options.path.exists() {
+        return Err(BlockError::from_kind(BlockErrorKind::AlreadyExists).with_path(options.path));
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(options.path)
+        .map_err(|e| {
+            BlockError::from_kind(BlockErrorKind::Io)
+                .with_path(options.path)
+                .with_source(e)
+        })?;
+
+    match image_type {
+        ImageType::Raw => {
+            file.set_len(size)
+                .map_err(|e| BlockError::from(e).with_path(options.path))?;
+        }
+        ImageType::Qcow2 => {
+            let raw_file = crate::qcow::RawFile::new(file.try_clone()?, options.direct);
+            crate::qcow::QcowFile::new(raw_file, 3, size, options.sparse)
+                .map_err(|e| e.with_path(options.path))?;
+        }
+        _ => {
+            return Err(
+                BlockError::from_kind(BlockErrorKind::UnsupportedFeature).with_path(options.path)
+            );
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod unit_tests {
     use std::io::Write;
