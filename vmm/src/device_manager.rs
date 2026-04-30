@@ -685,6 +685,12 @@ pub enum DeviceManagerError {
     #[error("No block mirroring is active for the current disk with identifier: {0}")]
     BlockMirrorNotActive(String),
 
+    /// Mirroring is already active for the current device.
+    #[error(
+        "Failed to start block mirroring for the disk with identifier: {0} as mirroring is already active"
+    )]
+    BlockMirrorAlreadyActive(String),
+
     /// The block mirroring destination path already exists.
     #[error(
         "The block mirroring destination path already exists for the disk with identifier: {0} at path: {1}"
@@ -5347,6 +5353,13 @@ impl DeviceManager {
             let mut disk = dev.lock().unwrap();
             if disk.id() != device_id {
                 continue;
+            }
+
+            if let Some(status) = disk.mirror_status() {
+                return Err(DeviceManagerError::BlockMirrorAlreadyActive(format!(
+                    "{device_id} is in phase {:?}, cancel the mirror before starting a new one",
+                    status.phase
+                )));
             }
 
             let (options, image_type) = {
