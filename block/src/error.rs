@@ -42,6 +42,8 @@ pub enum BlockErrorKind {
     NotFound,
     /// An internal counter or limit was exceeded.
     Overflow,
+    /// A mirror swap was requested but was unsuccessful.
+    MirrorSwap,
 }
 
 impl Display for BlockErrorKind {
@@ -54,6 +56,7 @@ impl Display for BlockErrorKind {
             Self::OutOfBounds => write!(f, "Out of bounds"),
             Self::NotFound => write!(f, "Not found"),
             Self::Overflow => write!(f, "Overflow"),
+            Self::MirrorSwap => write!(f, "Failed to swap AsyncIO in virtqueue worker for mirror"),
         }
     }
 }

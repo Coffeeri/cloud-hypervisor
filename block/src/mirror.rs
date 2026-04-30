@@ -608,7 +608,6 @@ impl CopyWorker {
 /// Handle returned by `Block::start_mirror`. The owner (typically the
 /// device manager) keeps it alive for the duration of the mirror to
 /// observe `MirrorState` and to retain the [`CopyWorker`] thread.
-#[allow(dead_code)]
 pub struct BlockMirrorHandle {
     pub state: Arc<MirrorState>,
     pub copy_worker: CopyWorkerHandle,
