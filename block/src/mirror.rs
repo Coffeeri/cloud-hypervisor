@@ -204,6 +204,20 @@ impl MirrorState {
 
         *current = target;
     }
+
+    pub fn status(&self) -> MirrorStatus {
+        MirrorStatus {
+            phase: self.phase(),
+            copied_bytes: self.copied_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            total_bytes: self.total_bytes,
+        }
+    }
+}
+
+pub struct MirrorStatus {
+    pub phase: MirrorPhase,
+    pub copied_bytes: u64,
+    pub total_bytes: u64,
 }
 
 /// State for a single inflight mirrored request awaiting source and
