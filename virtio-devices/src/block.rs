@@ -29,7 +29,7 @@ use block::error::{BlockError, BlockErrorKind, BlockResult};
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::mirror::{
     BlockMirrorHandle, CopyWorker, CopyWorkerHandle, MIRROR_BLOCK_SIZE, MirrorPhase, MirrorState,
-    MirroringAsyncIo,
+    MirrorStatus, MirroringAsyncIo,
 };
 use block::{
     ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
@@ -960,6 +960,7 @@ pub struct Block {
     /// [`BlockQueueCommand`] and writes the corresponding evt.
     queue_cmd_senders: Vec<BlockQueueCommandSender>,
     next_queue_cmd_op_id: u64,
+    mirror_handle: Option<BlockMirrorHandle>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1128,6 +1129,7 @@ impl Block {
             draining_active_requests: Arc::new(AtomicBool::new(false)),
             queue_cmd_senders: Vec::new(),
             next_queue_cmd_op_id: 1,
+            mirror_handle: None,
         })
     }
 
@@ -1308,10 +1310,7 @@ impl Block {
     ///
     /// Returns an error on `logical_size()` failure, [`MirroringAsyncIo`]
     /// construction failure, or copy worker spawn failure.
-    pub fn start_mirror(
-        &mut self,
-        destination: Box<dyn AsyncFullDiskFile>,
-    ) -> BlockResult<BlockMirrorHandle> {
+    pub fn start_mirror(&mut self, destination: Box<dyn AsyncFullDiskFile>) -> BlockResult<()> {
         let state = MirrorState::new(self.disk_image.logical_size()?);
         let op_id = self.next_mirror_op_id();
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -1362,11 +1361,12 @@ impl Block {
             }
         };
 
-        Ok(BlockMirrorHandle {
+        self.mirror_handle = Some(BlockMirrorHandle {
             state,
             copy_worker,
             destination,
-        })
+        });
+        Ok(())
     }
 
     fn next_mirror_op_id(&mut self) -> u64 {
@@ -1440,6 +1440,11 @@ impl Block {
         drop(ack_tx);
         Self::send_mirror_queue_commands(commands)?;
         Self::wait_for_mirror_queue_command_acks(op_id, &ack_rx, self.queue_cmd_senders.len())
+    }
+
+    /// Returns a snapshot of the current mirror progress.
+    pub fn mirror_status(&self) -> Option<MirrorStatus> {
+        self.mirror_handle.as_ref().map(|h| h.state.status())
     }
 
     #[cfg(fuzzing)]
