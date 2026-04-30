@@ -35,7 +35,8 @@ use arch::{DeviceType, MmioDeviceInfo};
 use arch::{NumaNodes, layout};
 use block::ImageType;
 use block::error::BlockError;
-use block::factory::{DiskOpenOptions, open_disk};
+use block::factory::{DiskOpenOptions, create_disk, open_disk};
+use block::mirror::MirrorStatus;
 #[cfg(target_arch = "riscv64")]
 use devices::aia;
 #[cfg(target_arch = "x86_64")]
@@ -679,6 +680,16 @@ pub enum DeviceManagerError {
         specified: ImageType,
         detected: ImageType,
     },
+
+    /// No block mirroring is active for the current device.
+    #[error("No block mirroring is active for the current disk with identifier: {0}")]
+    BlockMirrorNotActive(String),
+
+    /// The block mirroring destination path already exists.
+    #[error(
+        "The block mirroring destination path already exists for the disk with identifier: {0} at path: {1}"
+    )]
+    BlockMirrorDestAlreadyExists(String, String),
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
@@ -5318,6 +5329,86 @@ impl DeviceManager {
             debug!("Drop VfioOps given no active VFIO devices.");
             self.vfio_ops = None;
         }
+    }
+
+    /// Start mirroring the disk identified by `device_id` to a new
+    /// file at `dest_path`.
+    ///
+    /// The destination file must not exist yet. It is created with the
+    /// same image format and backend flags as the source disk, sized to
+    /// match the source's logical size, and handed to the virtio block
+    /// device which mirrors later guest writes out to both backends
+    /// while a background worker copies the existing source contents.
+    ///
+    /// Returns an error if no disk with the given identifier is attached
+    /// to the VM, or the destination cannot be created or opened.
+    pub fn mirror_disk(&self, device_id: &str, dest_path: &Path) -> DeviceManagerResult<()> {
+        for dev in &self.block_devices {
+            let mut disk = dev.lock().unwrap();
+            if disk.id() != device_id {
+                continue;
+            }
+
+            let (options, image_type) = {
+                let cfg = self.config.lock().unwrap();
+                let disks = cfg
+                    .disks
+                    .as_ref()
+                    .ok_or_else(|| DeviceManagerError::UnknownDeviceId(device_id.to_string()))?;
+
+                let src = disks
+                    .iter()
+                    .find(|d| d.pci_common.id.as_deref() == Some(device_id))
+                    .ok_or_else(|| DeviceManagerError::UnknownDeviceId(device_id.to_string()))?;
+
+                (
+                    &DiskOpenOptions {
+                        path: dest_path,
+                        readonly: false, // ignore source's readonly, mirroring needs write access.
+                        direct: src.direct,
+                        sparse: src.sparse,
+                        backing_files: src.backing_files,
+                        disable_io_uring: src.disable_io_uring,
+                        disable_aio: src.disable_aio,
+                    },
+                    src.image_type,
+                )
+            };
+
+            // TODO: make this explicit for Law of Leas Astonishment
+            // Create new disk when path does not exist.
+            if !dest_path.exists() {
+                let logical_size = disk.logical_size().map_err(DeviceManagerError::Disk)?;
+                create_disk(options, image_type, logical_size).map_err(DeviceManagerError::Disk)?;
+            }
+            let dest_disk = open_disk(options).map_err(DeviceManagerError::Disk)?.disk;
+
+            disk.start_mirror(dest_disk)
+                .map_err(DeviceManagerError::Disk)?;
+
+            return Ok(());
+        }
+
+        Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
+    }
+
+    /// Return the current state of the active mirror for the disk
+    /// identified by `device_id`.
+    ///
+    /// Returns an error if no disk with the given identifier is
+    /// attached to the VM, or if the disk has no active mirror.
+    pub fn mirror_disk_status(&self, device_id: &str) -> DeviceManagerResult<MirrorStatus> {
+        for dev in &self.block_devices {
+            let disk = dev.lock().unwrap();
+
+            if disk.id() == device_id {
+                return disk.mirror_status().ok_or_else(|| {
+                    DeviceManagerError::BlockMirrorNotActive(device_id.to_string())
+                });
+            }
+        }
+
+        Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
     }
 
     /// Helps the environment converge quickly after a live migration by
