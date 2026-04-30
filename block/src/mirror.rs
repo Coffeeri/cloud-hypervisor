@@ -238,6 +238,30 @@ pub struct MirroringAsyncIo {
     inflight_requests: HashMap<u64, InflightMutatingRequest>,
 }
 impl MirroringAsyncIo {
+    #[allow(dead_code)]
+    /// Builds a [`MirroringAsyncIo`] for one virtqueue. Returns the
+    /// async I/O handle wrapped in `Box<dyn AsyncIo>` plus a clone of
+    /// the destination's notifier eventfd.
+    pub fn create(
+        source_disk: &dyn AsyncFullDiskFile,
+        destination_disk: &dyn AsyncFullDiskFile,
+        state: Arc<MirrorState>,
+        ring_depth: u32,
+    ) -> BlockResult<(Box<dyn AsyncIo>, EventFd)> {
+        let source = source_disk.create_async_io(ring_depth)?;
+        let destination = destination_disk.create_async_io(ring_depth)?;
+        let dest_notifier = destination.notifier().try_clone()?;
+
+        let async_io = Box::new(MirroringAsyncIo {
+            source,
+            destination,
+            state,
+            inflight_requests: HashMap::new(),
+        });
+
+        Ok((async_io, dest_notifier))
+    }
+
     /// Fail virtqueue worker and go into passthrough.
     /// While this keeps the VM and source block-dev state valid, the operator
     /// needs to cancel to cleanup resources.
@@ -588,6 +612,7 @@ impl CopyWorker {
 pub struct BlockMirrorHandle {
     pub state: Arc<MirrorState>,
     pub copy_worker: CopyWorkerHandle,
+    pub destination: Box<dyn AsyncFullDiskFile>,
 }
 
 /// Single-fd `epoll` wrapper. Built once per eventfd and reused for
