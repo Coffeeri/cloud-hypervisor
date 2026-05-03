@@ -277,6 +277,9 @@ pub enum Error {
     #[error("Failed to read disk mirror state")]
     DiskMirrorStatus,
 
+    #[error("Failed to complete disk mirror")]
+    DiskMirrorComplete,
+
     #[error("Cannot activate virtio devices")]
     ActivateVirtioDevices(#[source] DeviceManagerError),
 
@@ -3325,6 +3328,15 @@ impl Vm {
             .unwrap()
             .mirror_disk_status(id)
             .map_err(Error::DeviceManager)
+    }
+
+    pub fn mirror_disk_complete(&self, id: &str) -> Result<()> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .mirror_disk_complete(id)
+            .map_err(Error::DeviceManager)?;
+        Ok(())
     }
 
     /// Calls [`DeviceManager::post_migration_announce`].
