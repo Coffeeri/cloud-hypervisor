@@ -2649,6 +2649,16 @@ impl RequestHandler for Vmm {
 
         Err(VmError::DiskMirrorStatus)
     }
+
+    fn vm_disk_mirror_pivot(&mut self, id: String) -> result::Result<(), VmError> {
+        self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        if let Some(ref mut vm) = self.vm {
+            return vm.mirror_disk_pivot(&id);
+        }
+
+        Err(VmError::DiskMirrorPivot)
+    }
 }
 
 const CPU_MANAGER_SNAPSHOT_ID: &str = "cpu-manager";

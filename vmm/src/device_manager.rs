@@ -695,6 +695,9 @@ pub enum DeviceManagerError {
         "The block mirroring destination path already exists for the disk with identifier: {0} at path: {1}"
     )]
     BlockMirrorDestAlreadyExists(String, String),
+
+    #[error("Failed to pivot block mirror for disk {0}: {1}")]
+    BlockMirrorPivot(String, #[source] BlockError),
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
@@ -5273,6 +5276,21 @@ impl DeviceManager {
             }
         }
 
+        Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
+    }
+
+    /// Pivots the active block mirror for the disk identified by `device_id`
+    /// to the destination disk. Errors if no disk with that identifier is
+    /// attached, if no mirror is active, or if the mirror is not yet synced.
+    pub fn mirror_disk_pivot(&self, device_id: &str) -> DeviceManagerResult<()> {
+        for dev in &self.block_devices {
+            let mut disk = dev.lock().unwrap();
+            if disk.id() == device_id {
+                return disk
+                    .pivot_mirror()
+                    .map_err(|e| DeviceManagerError::BlockMirrorPivot(device_id.to_string(), e));
+            }
+        }
         Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
     }
 }
