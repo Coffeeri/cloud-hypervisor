@@ -109,4 +109,12 @@ pub trait AsyncIo: Send {
     fn alignment(&self) -> u64 {
         SECTOR_SIZE
     }
+
+    /// Returns true when this implementation has request pairings in flight
+    /// that have not yet been acked to the guest. Only the mirroring
+    /// implementation tracks such pairings, plain backends always return
+    /// false.
+    fn has_inflight_requests(&self) -> bool {
+        false
+    }
 }
