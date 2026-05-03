@@ -1425,6 +1425,67 @@ impl Block {
         Ok(())
     }
 
+    /// Switch the device's mirroring wrapper to the destination disk.
+    ///
+    /// Each virtqueue worker swaps its [`MirroringAsyncIo`] for a plain
+    /// [`AsyncIo`] on the destination through the same slot and eventfd
+    /// mechanism used to install the mirror. After this call the source
+    /// disk is no longer used by the VM and the operator can detach or
+    /// remove it.
+    ///
+    /// Returns [`BlockErrorKind::MirrorNotActive`] when no mirror is
+    /// active for the device, and [`BlockErrorKind::MirrorNotReady`] when
+    /// the copy worker has not yet reported the ready phase. The mirror
+    /// handle is left in place on either error so the caller can poll the
+    /// state and retry.
+    pub fn complete_mirror(&mut self) -> BlockResult<()> {
+        let op_id = self.next_mirror_op_id();
+        let (ack_tx, ack_rx) = mpsc::channel();
+
+        let handle = self
+            .mirror_handle
+            .as_ref()
+            .ok_or_else(|| BlockError::from_kind(BlockErrorKind::MirrorNotActive))?;
+
+        // Only allow completing when the copy worker is in the ready phase or as a retry.
+        if !matches!(
+            handle.state.phase(),
+            MirrorPhase::Ready | MirrorPhase::Completing
+        ) {
+            return Err(BlockError::from_kind(BlockErrorKind::MirrorNotReady));
+        }
+
+        let mut commands = Vec::with_capacity(self.queue_cmd_senders.len());
+        for sender in &self.queue_cmd_senders {
+            let async_io = handle
+                .destination
+                .create_async_io(sender.queue_size as u32)?;
+            commands.push((
+                sender,
+                BlockQueueCommand::complete_to_destination(op_id, async_io, ack_tx.clone()),
+            ));
+        }
+
+        drop(ack_tx);
+
+        // When only partial virtqueue workers are switched over, we panic, as we prefer that to data loss.
+        handle.state.transition_to_phase(MirrorPhase::Completing);
+        Self::send_mirror_queue_commands(commands).expect("mirror queue commands sent");
+        Self::wait_for_mirror_queue_command_acks(op_id, &ack_rx, self.queue_cmd_senders.len())
+            .expect("mirror queue command acks received");
+        handle.state.transition_to_phase(MirrorPhase::Completed);
+
+        // Pre-build succeeded, own the destination now and commit the completion.
+        let BlockMirrorHandle {
+            destination,
+            copy_worker: _,
+            state: _,
+        } = self.mirror_handle.take().unwrap();
+
+        self.disk_image = destination;
+        Ok(())
+    }
+
     fn next_mirror_op_id(&mut self) -> u64 {
         let op_id = self.next_queue_cmd_op_id;
         self.next_queue_cmd_op_id = self.next_queue_cmd_op_id.wrapping_add(1);
