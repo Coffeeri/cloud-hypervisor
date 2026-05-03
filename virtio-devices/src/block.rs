@@ -230,6 +230,8 @@ impl BlockQueueCommand {
 /// are shared with the API thread, which fills `slot` from
 /// [`Block::start_mirror`] (or `complete_mirror`/`cancel_mirror` in the
 /// future) and writes to `evt` to wake the worker.
+/// The worker takes the update, stores it in `pending_mirror_update`,
+/// and applies it once the current `disk_image` has no in-flight requests.
 pub struct BlockQueueCommandReceiver {
     /// Next [`BlockQueueCommand`] to apply. Written by the API thread,
     /// taken by the worker on `MIRROR_UPDATE_EVENT`.
@@ -241,6 +243,9 @@ pub struct BlockQueueCommandReceiver {
     /// `MIRROR_DEST_COMPLETION_EVENT`. `None` outside the mirroring
     /// phase.
     pub current_dest_notifier: Option<EventFd>,
+    /// Update taken from `slot` and held until `disk_image` reports
+    /// no in-flight requests. Owned and accessed only by the worker.
+    pending_block_queue_command: Option<BlockQueueCommand>,
 }
 
 struct BlockQueueCommandSender {
@@ -350,6 +355,16 @@ impl BlockEpollHandler {
     }
 
     fn process_queue_submit(&mut self) -> Result<()> {
+        // Defer submitting new descriptors while a mirror swap is draining.
+        // The queue_evt is kicked at the end of the swap.
+        if self
+            .cmd_receiver
+            .as_ref()
+            .is_some_and(|m| m.pending_block_queue_command.is_some())
+        {
+            return Ok(());
+        }
+
         let queue = &mut self.queue;
         let queue_size = queue.size();
         let mut batch_requests = Vec::new();
@@ -664,6 +679,52 @@ impl BlockEpollHandler {
         Ok(())
     }
 
+    /// Applies a pending mirror update if one is staged and the current
+    /// `disk_image` has no in-flight requests. Returns `Ok(())` without
+    /// changes when either condition is not met. The next completion
+    /// event will trigger another attempt.
+    fn try_apply_pending_block_queue_command(
+        &mut self,
+        helper: &mut EpollHelper,
+    ) -> result::Result<(), EpollHelperError> {
+        // If any disk requests are in flight, we can't apply the pending command.
+        if !self.inflight_requests.is_empty() || self.disk_image.has_inflight_requests() {
+            return Ok(());
+        }
+
+        let Some(cmd_receiver) = self.cmd_receiver.as_mut() else {
+            return Ok(());
+        };
+
+        let Some(command) = cmd_receiver.pending_block_queue_command.take() else {
+            return Ok(());
+        };
+
+        let op_id = command.op_id;
+        let ack = command.ack.clone();
+
+        let result = Self::apply_block_queue_command(
+            &mut self.disk_image,
+            &mut cmd_receiver.current_dest_notifier,
+            command,
+            helper,
+        );
+
+        let _ = ack.send(BlockQueueAck { op_id, result });
+
+        // While the command was pending, QUEUE_AVAIL_EVENT handling consumed the
+        // guest's kicks without submitting (see the guard in process_queue_submit).
+        // The guest won't kick again for descriptors it already queued, so process
+        // the avail ring now, whether the command succeeded or failed, or those
+        // requests stall until unrelated guest I/O arrives.
+        let rate_limit_reached = self.rate_limiter.as_ref().is_some_and(|r| r.is_blocked());
+        if !rate_limit_reached {
+            self.process_queue_submit_and_signal()?;
+        }
+
+        Ok(())
+    }
+
     #[inline]
     fn find_inflight_request(&mut self, completed_head: u16) -> Result<Request> {
         // This loop neatly handles the fast path where the completions are
@@ -915,6 +976,7 @@ impl EpollHelperHandler for BlockEpollHandler {
                 })?;
 
                 self.drain_completions()?;
+                self.try_apply_pending_block_queue_command(helper)?;
             }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
@@ -934,23 +996,20 @@ impl EpollHelperHandler for BlockEpollHandler {
                 }
             }
             BLOCK_COMMAND_EVENT => {
-                // Apply a staged command: swap disk_image and re-register notifiers.
-                if let Some(m) = self.cmd_receiver.as_mut() {
-                    let _ = m.evt.read();
-                    if let Some(command) = m.cmd.lock().unwrap().take() {
-                        Self::apply_block_queue_command(
-                            &mut self.disk_image,
-                            &mut m.current_dest_notifier,
-                            command,
-                            helper,
-                        )
-                        .map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to apply block queue command: {e}"
-                            ))
-                        })?;
+                if let Some(cmd_receiver) = self.cmd_receiver.as_mut() {
+                    let _ = cmd_receiver.evt.read();
+                    if let Some(update) = cmd_receiver.cmd.lock().unwrap().take()
+                        && let Some(stale) =
+                            cmd_receiver.pending_block_queue_command.replace(update)
+                    {
+                        warn!(
+                            "Replacing pending block queue command {:?} before it was applied",
+                            stale.kind
+                        );
                     }
                 }
+
+                self.try_apply_pending_block_queue_command(helper)?;
             }
             MIRROR_DEST_COMPLETION_EVENT => {
                 // Same as COMPLETION_EVENT but draining the captured dest notifier.
@@ -965,6 +1024,7 @@ impl EpollHelperHandler for BlockEpollHandler {
 
                     self.drain_completions()?;
                 }
+                self.try_apply_pending_block_queue_command(helper)?;
             }
             _ => {
                 return Err(EpollHelperError::HandleEvent(anyhow!(
@@ -1568,6 +1628,7 @@ impl VirtioDevice for Block {
                 cmd: Arc::clone(&queue_command),
                 evt: mirror_handler_evt,
                 current_dest_notifier: None,
+                pending_block_queue_command: None,
             };
             self.queue_cmd_senders.push(BlockQueueCommandSender {
                 cmd: queue_command,
