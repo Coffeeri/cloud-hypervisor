@@ -44,6 +44,10 @@ pub enum BlockErrorKind {
     Overflow,
     /// The file already exists, when disk creation was requested.
     AlreadyExists,
+    /// A mirror operation was requested but no mirror is active for the device.
+    MirrorNotActive,
+    /// A pivot was requested but the mirror has not reached the synced phase.
+    MirrorNotInSync,
 }
 
 impl Display for BlockErrorKind {
@@ -57,6 +61,8 @@ impl Display for BlockErrorKind {
             Self::NotFound => write!(f, "Not found"),
             Self::Overflow => write!(f, "Overflow"),
             Self::AlreadyExists => write!(f, "Already exists"),
+            Self::MirrorNotActive => write!(f, "No active mirror for the device"),
+            Self::MirrorNotInSync => write!(f, "Mirror is not yet in sync, cannot pivot"),
         }
     }
 }
