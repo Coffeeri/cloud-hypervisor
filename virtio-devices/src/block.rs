@@ -126,9 +126,11 @@ pub type Result<T> = result::Result<T, Error>;
 /// [`MirrorHandoff::slot`]. On `MIRROR_UPDATE_EVENT` the worker
 /// replaces its `disk_image` with `async_io` and registers
 /// `dest_notifier` for `MIRROR_DEST_COMPLETION_EVENT`.
+/// `dest_notifier` is `None` when swapping to a plain (non-mirroring)
+/// AsyncIo, as done by pivot and cancel.
 pub struct MirrorUpdate {
     pub async_io: Box<dyn AsyncIo>,
-    pub dest_notifier: EventFd,
+    pub dest_notifier: Option<EventFd>,
 }
 
 /// Per-virtqueue plumbing for swapping the worker's `disk_image` at
@@ -138,6 +140,8 @@ pub struct MirrorUpdate {
 /// are shared with the API thread, which fills `slot` from
 /// [`Block::start_mirror`] (or `pivot_mirror`/`cancel_mirror` in the
 /// future) and writes to `evt` to wake the worker.
+/// The worker takes the update, stores it in `pending_mirror_update`,
+/// and applies it once the current `disk_image` has no in-flight requests.
 pub struct MirrorHandoff {
     /// Next [`MirrorUpdate`] to apply. Written by the API thread,
     /// taken by the worker on `MIRROR_UPDATE_EVENT`.
@@ -149,6 +153,9 @@ pub struct MirrorHandoff {
     /// `MIRROR_DEST_COMPLETION_EVENT`. `None` outside the mirroring
     /// phase.
     pub current_dest_notifier: Option<EventFd>,
+    /// Update taken from `slot` and held until `disk_image` reports
+    /// no in-flight requests. Owned and accessed only by the worker.
+    pending_mirror_update: Option<MirrorUpdate>,
 }
 
 struct MirrorWriter {
@@ -277,6 +284,16 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
     }
 
     fn process_queue_submit(&mut self) -> Result<()> {
+        // Defer submitting new descriptors while a mirror swap is draining.
+        // The queue_evt is kicked at the end of the swap.
+        if self
+            .mirror
+            .as_ref()
+            .is_some_and(|m| m.pending_mirror_update.is_some())
+        {
+            return Ok(());
+        }
+
         if self.needs_reset() {
             return Ok(());
         }
@@ -474,6 +491,64 @@ Setting device status to 'NEEDS_RESET' and stopping processing queues until rese
         if !rate_limit_reached {
             self.process_queue_submit_and_signal()?;
         }
+        Ok(())
+    }
+
+    /// Applies a pending mirror update if one is staged and the current
+    /// `disk_image` has no in-flight requests. Returns `Ok(())` without
+    /// changes when either condition is not met. The next completion
+    /// event will trigger another attempt.
+    fn try_apply_pending_mirror_update(
+        &mut self,
+        helper: &mut EpollHelper,
+    ) -> result::Result<(), EpollHelperError> {
+        if self.disk_image.has_inflight_requests() {
+            return Ok(());
+        }
+
+        let Some(mirror) = self.mirror.as_mut() else {
+            return Ok(());
+        };
+
+        let Some(update) = mirror.pending_mirror_update.take() else {
+            return Ok(());
+        };
+
+        // Deregister the old completion notifier. This is the notifier of the
+        // current disk_image, registered originally in `run` or in a previous swap.
+        helper.del_event_custom(
+            self.disk_image.notifier().as_raw_fd(),
+            COMPLETION_EVENT,
+            epoll::Events::EPOLLIN,
+        )?;
+
+        // Tear down old dest notifier registration if any.
+        if let Some(old_notifier) = mirror.current_dest_notifier.take() {
+            helper.del_event_custom(
+                old_notifier.as_raw_fd(),
+                MIRROR_DEST_COMPLETION_EVENT,
+                epoll::Events::EPOLLIN,
+            )?;
+        }
+
+        // Register the new dest notifier if the update carries one. Pivot and cancel won't.
+        if let Some(new_notifier) = update.dest_notifier {
+            helper.add_event(new_notifier.as_raw_fd(), MIRROR_DEST_COMPLETION_EVENT)?;
+            mirror.current_dest_notifier = Some(new_notifier);
+        }
+
+        // Swap the current disk AsyncIo with the new one, then register new notifier.
+        self.disk_image = update.async_io;
+        helper.add_event(self.disk_image.notifier().as_raw_fd(), COMPLETION_EVENT)?;
+
+        // Kick queue_evt. While pending_mirror_update was set, the submit path
+        // guard skipped any descriptors signaled by QUEUE_AVAIL_EVENT after the
+        // guest's eventfd was already consumed. Without this write, the guest
+        // would wait indefinitely on a write it already submitted.
+        self.queue_evt.write(1).map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to re-arm queue_evt: {e}"))
+        })?;
+
         Ok(())
     }
 
@@ -729,6 +804,7 @@ impl EpollHelperHandler for BlockEpollHandler {
                 })?;
 
                 self.drain_completions()?;
+                self.try_apply_pending_mirror_update(helper)?;
             }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
@@ -750,17 +826,14 @@ impl EpollHelperHandler for BlockEpollHandler {
             MIRROR_UPDATE_EVENT => {
                 // Swap disk_image to the new MirroringAsyncIo and register its
                 // destination notifier as a second completion source.
-                if let Some(m) = &mut self.mirror {
-                    let _ = m.evt.read();
-                    if let Some(update) = m.slot.lock().unwrap().take() {
-                        helper.add_event(
-                            update.dest_notifier.as_raw_fd(),
-                            MIRROR_DEST_COMPLETION_EVENT,
-                        )?;
-                        m.current_dest_notifier = Some(update.dest_notifier);
-                        self.disk_image = update.async_io;
+                if let Some(mirror) = self.mirror.as_mut() {
+                    let _ = mirror.evt.read();
+                    if let Some(update) = mirror.slot.lock().unwrap().take() {
+                        mirror.pending_mirror_update = Some(update);
                     }
                 }
+
+                self.try_apply_pending_mirror_update(helper)?;
             }
             MIRROR_DEST_COMPLETION_EVENT => {
                 // Same as COMPLETION_EVENT but draining the captured dest notifier.
@@ -775,6 +848,7 @@ impl EpollHelperHandler for BlockEpollHandler {
 
                     self.drain_completions()?;
                 }
+                self.try_apply_pending_mirror_update(helper)?;
             }
             _ => {
                 return Err(EpollHelperError::HandleEvent(anyhow!(
@@ -1146,7 +1220,7 @@ impl Block {
                 mirror_writer,
                 MirrorUpdate {
                     async_io,
-                    dest_notifier,
+                    dest_notifier: Some(dest_notifier),
                 },
             ));
         }
@@ -1289,6 +1363,7 @@ impl VirtioDevice for Block {
                 slot: Arc::clone(&mirror_slot),
                 evt: mirror_handler_evt,
                 current_dest_notifier: None,
+                pending_mirror_update: None,
             };
             self.mirror_writers.push(MirrorWriter {
                 slot: mirror_slot,
