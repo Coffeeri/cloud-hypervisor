@@ -24,7 +24,8 @@ use block::disk_file::AsyncFullDiskFile;
 use block::error::{BlockError, BlockErrorKind, BlockResult};
 use block::fcntl::{LockError, LockGranularity, LockGranularityChoice, LockType, get_lock_state};
 use block::mirror::{
-    BlockMirrorHandle, CopyWorker, MIRROR_BLOCK_SIZE, MirrorState, MirrorStatus, MirroringAsyncIo,
+    BlockMirrorHandle, CopyWorker, MIRROR_BLOCK_SIZE, MirrorPhase, MirrorState, MirrorStatus,
+    MirroringAsyncIo,
 };
 use block::{
     ExecuteAsync, ExecuteError, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType,
@@ -1253,6 +1254,62 @@ impl Block {
             copy_worker,
             destination,
         });
+        Ok(())
+    }
+
+    /// Switch the device's mirroring wrapper to the destination disk.
+    ///
+    /// Each virtqueue worker swaps its [`MirroringAsyncIo`] for a plain
+    /// [`AsyncIo`] on the destination through the same slot and eventfd
+    /// mechanism used to install the mirror. After this call the source
+    /// disk is no longer used by the VM and the operator can detach or
+    /// remove it.
+    ///
+    /// Returns [`BlockErrorKind::MirrorNotActive`] when no mirror is
+    /// active for the device, and [`BlockErrorKind::MirrorNotInSync`] when
+    /// the copy worker has not yet reported the synced phase. The mirror
+    /// handle is left in place on either error so the caller can poll the
+    /// state and retry.
+    pub fn pivot_mirror(&mut self) -> BlockResult<()> {
+        let handle = self
+            .mirror_handle
+            .as_ref()
+            .ok_or_else(|| BlockError::from_kind(BlockErrorKind::MirrorNotActive))?;
+
+        if handle.state.phase() != MirrorPhase::Synced {
+            return Err(BlockError::from_kind(BlockErrorKind::MirrorNotInSync));
+        }
+
+        // Pre-build updates using a borrow on the still-held destination.
+        let mut updates = Vec::with_capacity(self.mirror_writers.len());
+        for mirror_writer in &self.mirror_writers {
+            let async_io = handle
+                .destination
+                .create_async_io(mirror_writer.queue_size as u32)?;
+            updates.push((
+                mirror_writer,
+                MirrorUpdate {
+                    async_io,
+                    dest_notifier: None,
+                },
+            ));
+        }
+
+        // Pre-build succeeded, own the destination now and commit the pivot.
+        let BlockMirrorHandle {
+            destination,
+            copy_worker: _,
+            state: _,
+        } = self.mirror_handle.take().unwrap();
+
+        // Fan out the updates to the virtqueue workers.
+        // Each will swap the MirroringAsyncIo for a plain AsyncIo.
+        for (mirror_writer, update) in updates {
+            *mirror_writer.slot.lock().unwrap() = Some(update);
+            mirror_writer.evt.write(1)?;
+        }
+
+        self.disk_image = destination;
         Ok(())
     }
 
