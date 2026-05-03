@@ -696,6 +696,9 @@ pub enum DeviceManagerError {
         "The block mirroring destination path already exists for the disk with identifier: {0} at path: {1}"
     )]
     BlockMirrorDestAlreadyExists(String, String),
+
+    #[error("Failed to complete block mirror for disk {0}: {1}")]
+    BlockMirrorComplete(String, #[source] BlockError),
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
@@ -5421,6 +5424,22 @@ impl DeviceManager {
             }
         }
 
+        Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
+    }
+
+    /// Completes the active block mirror for the disk identified by `device_id`,
+    /// switching over to the destination disk. Errors if no disk with that
+    /// identifier is attached, if no mirror is active, or if the mirror is not
+    /// yet ready.
+    pub fn mirror_disk_complete(&self, device_id: &str) -> DeviceManagerResult<()> {
+        for dev in &self.block_devices {
+            let mut disk = dev.lock().unwrap();
+            if disk.id() == device_id {
+                return disk.complete_mirror().map_err(|e| {
+                    DeviceManagerError::BlockMirrorComplete(device_id.to_string(), e)
+                });
+            }
+        }
         Err(DeviceManagerError::UnknownDeviceId(device_id.to_string()))
     }
 
