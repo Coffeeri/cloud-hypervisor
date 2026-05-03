@@ -448,6 +448,10 @@ impl AsyncIo for MirroringAsyncIo {
         // Stricter alignment wins. Same iovec goes to both backends.
         self.source.alignment().max(self.destination.alignment())
     }
+
+    fn has_inflight_requests(&self) -> bool {
+        !self.inflight_requests.is_empty()
+    }
 }
 
 /// Owns the copy worker thread's [`JoinHandle`]. The thread is joined
