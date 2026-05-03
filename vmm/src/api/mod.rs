@@ -156,6 +156,9 @@ pub enum ApiError {
     #[error("Error reading disk mirror state")]
     VmDiskMirrorStatus(#[source] VmError),
 
+    #[error("Error pivoting disk mirror")]
+    VmDiskMirrorPivot(#[source] VmError),
+
     /// The memory zone could not be resized.
     #[error("The memory zone could not be resized")]
     VmResizeZone(#[source] VmError),
@@ -250,6 +253,11 @@ pub struct VmDiskMirrorStartData {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct VmDiskMirrorStateData {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VmDiskMirrorPivotData {
     pub id: String,
 }
 
@@ -803,6 +811,7 @@ pub trait RequestHandler {
     ) -> Result<(), VmError>;
 
     fn vm_disk_mirror_status(&mut self, id: String) -> Result<Option<Vec<u8>>, VmError>;
+    fn vm_disk_mirror_pivot(&mut self, id: String) -> Result<(), VmError>;
 
     fn vm_add_device(&mut self, device_cfg: DeviceConfig) -> Result<Option<Vec<u8>>, VmError>;
 
@@ -1471,6 +1480,36 @@ impl ApiAction for VmDiskMirrorState {
                 .vm_disk_mirror_status(data.id)
                 .map_err(ApiError::VmDiskMirrorStatus)
                 .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmDiskMirrorPivot;
+
+impl ApiAction for VmDiskMirrorPivot {
+    type RequestBody = VmDiskMirrorPivotData;
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, data: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            let response = vmm
+                .vm_disk_mirror_pivot(data.id)
+                .map_err(ApiError::VmDiskMirrorPivot)
+                .map(|_| ApiResponsePayload::Empty);
 
             response_sender
                 .send(response)

@@ -37,6 +37,7 @@
 use std::fs::File;
 use std::sync::mpsc::Sender;
 
+use block::error::BlockErrorKind;
 use log::info;
 use micro_http::{Body, Method, Request, Response, StatusCode, Version};
 use vmm_sys_util::eventfd::EventFd;
@@ -48,11 +49,11 @@ use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
     AddDisk, ApiAction, ApiError, ApiRequest, NetConfig, VmAddDevice, VmAddFs,
     VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmDiskMirrorStart, VmDiskMirrorStartData,
-    VmDiskMirrorState, VmDiskMirrorStateData, VmMigrationProgress, VmNmi, VmPause,
-    VmPostMigrationAnnounce, VmPowerButton, VmReboot, VmReceiveMigration, VmReceiveMigrationData,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot,
+    VmCancelMigration, VmConfig, VmCounters, VmDelete, VmDiskMirrorPivot, VmDiskMirrorPivotData,
+    VmDiskMirrorStart, VmDiskMirrorStartData, VmDiskMirrorState, VmDiskMirrorStateData,
+    VmMigrationProgress, VmNmi, VmPause, VmPostMigrationAnnounce, VmPowerButton, VmReboot,
+    VmReceiveMigration, VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk,
+    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -574,6 +575,36 @@ impl PutHandler for VmDiskMirrorState {
 }
 
 impl GetHandler for VmDiskMirrorState {}
+
+impl PutHandler for VmDiskMirrorPivot {
+    fn handle_request(
+        &'static self,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+        body: &Option<Body>,
+        _files: Vec<File>,
+    ) -> Result<Option<Body>, HttpError> {
+        let body = body.as_ref().ok_or(HttpError::BadRequest)?;
+        let data: VmDiskMirrorPivotData = serde_json::from_slice(body.raw())?;
+
+        self.send(api_notifier, api_sender, data)
+            .map_err(|e| match &e {
+                ApiError::VmDiskMirrorPivot(VmError::DeviceManager(
+                    DeviceManagerError::UnknownDeviceId(_),
+                )) => HttpError::NotFound,
+                ApiError::VmDiskMirrorPivot(VmError::DeviceManager(
+                    DeviceManagerError::BlockMirrorPivot(_, block_err),
+                )) => match block_err.kind() {
+                    BlockErrorKind::MirrorNotActive => HttpError::NotFound,
+                    BlockErrorKind::MirrorNotInSync => HttpError::BadRequest,
+                    _ => HttpError::ApiError(e),
+                },
+                _ => HttpError::ApiError(e),
+            })
+    }
+}
+
+impl GetHandler for VmDiskMirrorPivot {}
 
 impl PutHandler for VmResize {
     fn handle_request(
