@@ -141,7 +141,7 @@ use kvm_bindings::{
 #[cfg(target_arch = "riscv64")]
 use kvm_bindings::{KVM_REG_RISCV_CORE, KVM_REG_RISCV_TIMER, kvm_riscv_core};
 #[cfg(feature = "tdx")]
-use kvm_bindings::{KVM_X86_SW_PROTECTED_VM, KVMIO};
+use kvm_bindings::{KVM_X86_TDX_VM, KVMIO};
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{Xsave as xsave2, kvm_xsave2};
 pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
@@ -1776,7 +1776,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
             #[cfg(feature = "tdx")]
             if _config.tdx_enabled {
-                vm_type = KVM_X86_SW_PROTECTED_VM.into();
+                vm_type = KVM_X86_TDX_VM.into();
             }
         }
 
