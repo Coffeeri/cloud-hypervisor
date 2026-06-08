@@ -302,31 +302,57 @@ pub enum TdxExitStatus {
 }
 
 #[cfg(feature = "tdx")]
-const TDX_MAX_NR_CPUID_CONFIGS: usize = 6;
+const TDX_MAX_NR_CPUID_CONFIGS: usize = 80;
 
 #[cfg(feature = "tdx")]
 #[repr(C)]
-#[derive(Debug, Default)]
-pub struct TdxCpuidConfig {
-    pub leaf: u32,
-    pub sub_leaf: u32,
-    pub eax: u32,
-    pub ebx: u32,
-    pub ecx: u32,
-    pub edx: u32,
-}
-
-#[cfg(feature = "tdx")]
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct TdxCapabilities {
-    pub attrs_fixed0: u64,
-    pub attrs_fixed1: u64,
-    pub xfam_fixed0: u64,
-    pub xfam_fixed1: u64,
-    pub nr_cpuid_configs: u32,
+#[derive(Debug)]
+pub struct kvm_cpuid2 {
+    pub nent: u32,
     pub padding: u32,
-    pub cpuid_configs: [TdxCpuidConfig; TDX_MAX_NR_CPUID_CONFIGS],
+    pub entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
+}
+#[cfg(feature = "tdx")]
+impl Default for kvm_cpuid2 {
+    fn default() -> Self {
+        Self {
+            nent: TDX_MAX_NR_CPUID_CONFIGS as u32,
+            padding: 0,
+            entries: [kvm_bindings::kvm_cpuid_entry2::default(); TDX_MAX_NR_CPUID_CONFIGS],
+        }
+    }
+}
+#[cfg(feature = "tdx")]
+#[repr(C)]
+#[derive(Debug)]
+pub struct TdxCapabilities {
+    pub supported_attrs: u64,
+    pub supported_xfam: u64,
+
+    pub kernel_tdvmcallinfo_1_r11: u64,
+    pub user_tdvmcallinfo_1_r11: u64,
+    pub kernel_tdvmcallinfo_1_r12: u64,
+    pub user_tdvmcallinfo_1_r12: u64,
+
+    pub reserved: [u64; 250],
+
+    pub cpuid: kvm_cpuid2,
+}
+#[cfg(feature = "tdx")]
+impl Default for TdxCapabilities {
+    fn default() -> Self {
+        Self {
+            supported_attrs: 0,
+            supported_xfam: 0,
+            kernel_tdvmcallinfo_1_r11: 0,
+            user_tdvmcallinfo_1_r11: 0,
+            kernel_tdvmcallinfo_1_r12: 0,
+            user_tdvmcallinfo_1_r12: 0,
+            reserved: [0_u64; 250],
+            // Initialize with a default, for example:
+            cpuid: kvm_cpuid2::default(),
+        }
+    }
 }
 
 #[cfg(feature = "tdx")]
@@ -1897,10 +1923,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_capabilities(&self) -> hypervisor::Result<TdxCapabilities> {
-        let data = TdxCapabilities {
-            nr_cpuid_configs: TDX_MAX_NR_CPUID_CONFIGS as u32,
-            ..Default::default()
-        };
+        let data = TdxCapabilities::default();
 
         tdx_command(
             &self.kvm.as_raw_fd(),

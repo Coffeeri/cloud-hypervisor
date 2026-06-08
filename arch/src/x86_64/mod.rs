@@ -1006,21 +1006,21 @@ fn common_cpuid_tdx_configuration(
         .map_err(Error::TdxCapabilities)?;
     info!("TDX capabilities {caps:#?}");
 
-    for entry in cpuid.iter_mut().filter(|entry| entry.function == 0xd) {
-        let xcr0_mask: u64 = 0x82ff;
-        let xss_mask: u64 = !xcr0_mask;
-        if entry.index == 0 {
-            entry.eax &= (caps.xfam_fixed0 as u32) & (xcr0_mask as u32);
-            entry.eax |= (caps.xfam_fixed1 as u32) & (xcr0_mask as u32);
-            entry.edx &= ((caps.xfam_fixed0 & xcr0_mask) >> 32) as u32;
-            entry.edx |= ((caps.xfam_fixed1 & xcr0_mask) >> 32) as u32;
-        } else if entry.index == 1 {
-            entry.ecx &= (caps.xfam_fixed0 as u32) & (xss_mask as u32);
-            entry.ecx |= (caps.xfam_fixed1 as u32) & (xss_mask as u32);
-            entry.edx &= ((caps.xfam_fixed0 & xss_mask) >> 32) as u32;
-            entry.edx |= ((caps.xfam_fixed1 & xss_mask) >> 32) as u32;
-        }
-    }
+    // for entry in cpuid.iter_mut().filter(|entry| entry.function == 0xd) {
+    //     let xcr0_mask: u64 = 0x82ff;
+    //     let xss_mask: u64 = !xcr0_mask;
+    //     if entry.index == 0 {
+    //         entry.eax &= (caps.xfam_fixed0 as u32) & (xcr0_mask as u32);
+    //         entry.eax |= (caps.xfam_fixed1 as u32) & (xcr0_mask as u32);
+    //         entry.edx &= ((caps.xfam_fixed0 & xcr0_mask) >> 32) as u32;
+    //         entry.edx |= ((caps.xfam_fixed1 & xcr0_mask) >> 32) as u32;
+    //     } else if entry.index == 1 {
+    //         entry.ecx &= (caps.xfam_fixed0 as u32) & (xss_mask as u32);
+    //         entry.ecx |= (caps.xfam_fixed1 as u32) & (xss_mask as u32);
+    //         entry.edx &= ((caps.xfam_fixed0 & xss_mask) >> 32) as u32;
+    //         entry.edx |= ((caps.xfam_fixed1 & xss_mask) >> 32) as u32;
+    //     }
+    // }
 
     Ok(())
 }
