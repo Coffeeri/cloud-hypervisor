@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::io::Write;
 use std::mem::zeroed;
+#[cfg(feature = "tdx")]
+use std::os::fd::AsRawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -922,6 +924,11 @@ impl CpuManager {
 
         #[cfg(target_arch = "x86_64")]
         let cpuid = {
+            #[cfg(feature = "tdx")]
+            let kvm_vm = vm
+                .as_any()
+                .downcast_ref::<hypervisor::kvm::KvmVm>()
+                .unwrap();
             let phys_bits = physical_bits(hypervisor.as_ref(), config.max_phys_bits);
             arch::generate_common_cpuid(
                 hypervisor.as_ref(),
@@ -933,6 +940,8 @@ impl CpuManager {
                     amx: config.features.amx,
                     profile: config.profile,
                 },
+                #[cfg(feature = "tdx")]
+                &kvm_vm.fd.as_raw_fd(),
             )
             .map_err(Error::CommonCpuId)?
         };

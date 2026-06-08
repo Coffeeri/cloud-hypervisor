@@ -14,6 +14,8 @@ pub mod regs;
 
 #[cfg(feature = "tdx")]
 pub mod tdx;
+#[cfg(feature = "tdx")]
+use std::os::fd::RawFd;
 
 mod arch_capabilities_checks;
 mod helpers;
@@ -650,6 +652,7 @@ impl CpuidFeatureEntry {
 pub fn generate_common_cpuid(
     hypervisor: &dyn hypervisor::Hypervisor,
     config: &CpuidConfig,
+    #[cfg(feature = "tdx")] vm_fd: &RawFd,
 ) -> super::Result<Vec<CpuIdEntry>> {
     #[allow(unused_unsafe)]
     // SAFETY: cpuid called with valid leaves
@@ -685,7 +688,7 @@ pub fn generate_common_cpuid(
             // TDX is not supported by CPU profiles other than host for the time being.
             return Err(Error::CpuProfileTdxIncompatibility.into());
         }
-        common_cpuid_tdx_configuration(&mut cpuid, hypervisor)?;
+        common_cpuid_tdx_configuration(&mut cpuid, hypervisor, vm_fd)?;
     }
 
     // Copy CPU identification string
@@ -1000,9 +1003,10 @@ fn required_common_cpuid_updates(
 fn common_cpuid_tdx_configuration(
     cpuid: &mut [CpuIdEntry],
     hypervisor: &dyn hypervisor::Hypervisor,
+    vm_fd: &RawFd,
 ) -> super::Result<()> {
     let caps = hypervisor
-        .tdx_capabilities()
+        .tdx_capabilities(vm_fd)
         .map_err(Error::TdxCapabilities)?;
     info!("TDX capabilities {caps:#?}");
 

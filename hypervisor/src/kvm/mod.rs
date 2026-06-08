@@ -658,7 +658,7 @@ struct KvmMemorySlot {
 
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
-    fd: Arc<VmFd>,
+    pub fd: Arc<VmFd>,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     #[cfg(feature = "sev_snp")]
@@ -1971,16 +1971,11 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     /// Retrieve TDX capabilities
     ///
     #[cfg(feature = "tdx")]
-    fn tdx_capabilities(&self) -> hypervisor::Result<TdxCapabilities> {
+    fn tdx_capabilities(&self, vm_fd: &RawFd) -> hypervisor::Result<TdxCapabilities> {
         let data = TdxCapabilities::default();
 
-        tdx_command(
-            &self.kvm.as_raw_fd(),
-            TdxCommand::Capabilities,
-            0,
-            (&raw const data).cast(),
-        )
-        .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
+        tdx_command(vm_fd, TdxCommand::Capabilities, 0, (&raw const data).cast())
+            .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
 
         Ok(data)
     }

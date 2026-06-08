@@ -1643,6 +1643,9 @@ impl Vmm {
                     amx,
                     profile,
                 },
+                #[cfg(feature = "tdx")]
+                // Live Migration is not supported when TDX is enabled
+                &(u32::MAX as std::os::unix::io::RawFd),
             )
             .context("Error generating common cpuid")
             .map_err(MigratableError::MigrateSend)?
@@ -1939,6 +1942,9 @@ impl Vmm {
                     amx: vm_config.cpus.features.amx,
                     profile: vm_config.cpus.profile,
                 },
+                #[cfg(feature = "tdx")]
+                // Live Migration is not supported when TDX is enabled
+                &(u32::MAX as std::os::unix::io::RawFd),
             )
             .context("Error generating common cpuid")
             .map_err(MigratableError::MigrateReceive)?
