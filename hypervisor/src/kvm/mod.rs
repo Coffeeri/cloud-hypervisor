@@ -1641,6 +1641,20 @@ fn tdx_command(
     Ok(())
 }
 
+#[cfg(feature = "tdx")]
+fn cpuid_find_entry(
+    cpuid: &kvm_cpuid2,
+    function: u32,
+    index: u32,
+) -> Option<kvm_bindings::kvm_cpuid_entry2> {
+    for cpuid_entry in &cpuid.entries[..cpuid.nent as usize] {
+        if cpuid_entry.function == function && cpuid_entry.index == index {
+            return Some(cpuid_entry.clone());
+        }
+    }
+    return None;
+}
+
 /// Wrapper over KVM system ioctls.
 pub struct KvmHypervisor {
     kvm: Kvm,
@@ -1916,6 +1930,41 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     ///
     fn get_host_ipa_limit(&self) -> i32 {
         self.kvm.get_host_ipa_limit()
+    }
+
+    ///
+    /// filter TDX capabilities with CPUID
+    ///
+    #[cfg(feature = "tdx")]
+    fn tdx_filter_cpuid(
+        &self,
+        cpuids: &mut Vec<CpuIdEntry>,
+        tdx_capabilities: &TdxCapabilities,
+    ) -> hypervisor::Result<()> {
+        // TODO: This does not make much sense
+        // A vector is being built, not used and then dropped again.
+        // The only observable effect of this function is that the input vector
+        // is possibly truncated
+        let host_cpuids = cpuids.clone();
+        let mut nent = 0;
+        for host_entry in host_cpuids.iter() {
+            if let Some(entry) = cpuid_find_entry(
+                &tdx_capabilities.cpuid,
+                host_entry.function,
+                host_entry.index,
+            ) {
+                cpuids[nent].function = host_entry.function;
+                cpuids[nent].index = host_entry.index;
+                cpuids[nent].flags = host_entry.flags;
+                cpuids[nent].eax = host_entry.eax & entry.eax;
+                cpuids[nent].ebx = host_entry.ebx & entry.ebx;
+                cpuids[nent].ecx = host_entry.ecx & entry.ecx;
+                cpuids[nent].edx = host_entry.edx & entry.edx;
+                nent += 1;
+            }
+        }
+        cpuids.truncate(nent);
+        return Ok(());
     }
 
     ///

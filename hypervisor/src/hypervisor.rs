@@ -170,6 +170,17 @@ pub trait Hypervisor: Send + Sync {
         unimplemented!()
     }
     ///
+    /// Retrieve TDX capabilities CPUID entry (flags, eax, ebx, ecx, edx)
+    ///
+    #[cfg(feature = "tdx")]
+    fn tdx_filter_cpuid(
+        &self,
+        cpuids: &mut Vec<CpuIdEntry>,
+        tdx_capabilities: &TdxCapabilities,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+    ///
     /// Get the number of supported hardware breakpoints
     ///
     fn get_guest_debug_hw_bps(&self) -> usize {
