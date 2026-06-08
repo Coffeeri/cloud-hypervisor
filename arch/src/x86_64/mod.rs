@@ -1001,7 +1001,7 @@ fn required_common_cpuid_updates(
 
 #[cfg(feature = "tdx")]
 fn common_cpuid_tdx_configuration(
-    cpuid: &mut [CpuIdEntry],
+    cpuid: &mut Vec<CpuIdEntry>,
     hypervisor: &dyn hypervisor::Hypervisor,
     vm_fd: &RawFd,
 ) -> super::Result<()> {
@@ -1009,24 +1009,11 @@ fn common_cpuid_tdx_configuration(
         .tdx_capabilities(vm_fd)
         .map_err(Error::TdxCapabilities)?;
     info!("TDX capabilities {caps:#?}");
-
-    // for entry in cpuid.iter_mut().filter(|entry| entry.function == 0xd) {
-    //     let xcr0_mask: u64 = 0x82ff;
-    //     let xss_mask: u64 = !xcr0_mask;
-    //     if entry.index == 0 {
-    //         entry.eax &= (caps.xfam_fixed0 as u32) & (xcr0_mask as u32);
-    //         entry.eax |= (caps.xfam_fixed1 as u32) & (xcr0_mask as u32);
-    //         entry.edx &= ((caps.xfam_fixed0 & xcr0_mask) >> 32) as u32;
-    //         entry.edx |= ((caps.xfam_fixed1 & xcr0_mask) >> 32) as u32;
-    //     } else if entry.index == 1 {
-    //         entry.ecx &= (caps.xfam_fixed0 as u32) & (xss_mask as u32);
-    //         entry.ecx |= (caps.xfam_fixed1 as u32) & (xss_mask as u32);
-    //         entry.edx &= ((caps.xfam_fixed0 & xss_mask) >> 32) as u32;
-    //         entry.edx |= ((caps.xfam_fixed1 & xss_mask) >> 32) as u32;
-    //     }
-    // }
-
-    Ok(())
+    // TODO: Better error handling
+    hypervisor
+        .tdx_filter_cpuid(cpuid, &caps)
+        .map_err(Error::TdxCapabilities)
+        .map_err(Into::into)
 }
 
 #[expect(clippy::too_many_arguments)]
