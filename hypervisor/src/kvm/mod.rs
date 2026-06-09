@@ -2711,6 +2711,23 @@ impl cpu::Vcpu for KvmVcpu {
                 }
                 VcpuExit::Hyperv => Ok(cpu::VmExit::Hyperv),
                 #[cfg(feature = "tdx")]
+                VcpuExit::Hypercall(exit) => {
+                    if exit.nr == 12 {
+                        // KVM_HC_MAP_GPA_RANGE
+                        if let Some(vm_ops) = &self.vm_ops {
+                            vm_ops
+                                .handle_hc_map_gpa_range(exit)
+                                .map(|_| cpu::VmExit::Ignore)
+                                .map_err(|e| cpu::HypervisorCpuError::RunVcpu(e.into()))
+                                .unwrap();
+                        }
+                    } else {
+                        error!("Hypercall.nr:{:?} isn't supported\n", exit.nr);
+                        return Ok(cpu::VmExit::Shutdown);
+                    }
+                    Ok(cpu::VmExit::Ignore)
+                }
+                #[cfg(feature = "tdx")]
                 VcpuExit::Unsupported(KVM_EXIT_TDX) => Ok(cpu::VmExit::Tdx),
                 VcpuExit::Debug(_) => Ok(cpu::VmExit::Debug),
                 #[cfg(feature = "sev_snp")]
