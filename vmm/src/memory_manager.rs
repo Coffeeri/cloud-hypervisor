@@ -39,6 +39,7 @@ use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::guest_memory::{Error as MmapError, FileOffset};
 use vm_memory::mmap::MmapRegionError;
+use vm_memory::mmap::MmapRegionBuilder;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
     GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion,
@@ -49,9 +50,7 @@ use vm_migration::{
     UffdError,
 };
 use vmm_sys_util::eventfd::EventFd;
-#[cfg(feature = "tdx")]
 use kvm_bindings::kvm_create_guest_memfd;
-#[cfg(feature = "tdx")]
 use kvm_ioctls::Cap;
 
 use crate::config::MemoryRestoreMode;
@@ -640,6 +639,7 @@ impl MemoryManager {
         zones: &[MemoryZoneConfig],
         prefault: Option<bool>,
         thp: bool,
+        vm: Option<&Arc<dyn hypervisor::Vm>>,
     ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
         let mut zone_iter = zones.iter();
         let mut mem_regions = Vec::new();
@@ -713,6 +713,7 @@ impl MemoryManager {
                     zone.host_numa_node,
                     None,
                     thp,
+                    vm,
                 )?;
 
                 // Add region to the list of regions associated with the
@@ -816,6 +817,7 @@ impl MemoryManager {
                         zone_config.host_numa_node,
                         existing_memory_files.remove(&guest_ram_mapping.slot),
                         thp,
+                        None,
                     )?;
                     memory_regions.push(Arc::clone(&region));
                     if let Some(memory_zone) = memory_zones.get_mut(&guest_ram_mapping.zone_id) {
@@ -1718,7 +1720,7 @@ impl MemoryManager {
                 .collect();
 
             let (mem_regions, mut memory_zones) =
-                Self::create_memory_regions_from_zones(&ram_regions, &zones, prefault, config.thp)?;
+                Self::create_memory_regions_from_zones(&ram_regions, &zones, prefault, config.thp, Some(&vm))?;
 
             let mut guest_memory = GuestMemoryMmap::from_arc_regions(mem_regions)
                 .map_err(Error::GuestRegionCollection)?;
@@ -1766,6 +1768,7 @@ impl MemoryManager {
                                 zone.host_numa_node,
                                 None,
                                 config.thp,
+                                Some(&vm),
                             )?;
 
                             guest_memory = guest_memory
@@ -2071,6 +2074,7 @@ impl MemoryManager {
         host_numa_node: Option<u32>,
         existing_memory_file: Option<File>,
         thp: bool,
+        vm: Option<&Arc<dyn hypervisor::Vm>>,
     ) -> Result<MmapRegion<AtomicBitmap>, Error> {
         let mut mmap_flags = if reserve { 0 } else { libc::MAP_NORESERVE };
 
@@ -2087,6 +2091,9 @@ impl MemoryManager {
                 mmap_flags |= libc::MAP_PRIVATE;
             }
             Some(Self::open_backing_file(backing_file, file_offset, shared)?)
+        } else if let Some(vm) = vm {
+            mmap_flags |= libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+            Some(Self::create_guest_memfd_file(vm, size)?)
         } else if shared || hugepages {
             // For hugepages we must also MAP_SHARED otherwise we will trigger #4805
             // because the MAP_PRIVATE will trigger CoW against the backing file with
@@ -2098,8 +2105,30 @@ impl MemoryManager {
             None
         };
 
-        let region = MmapRegion::build(fo, size, libc::PROT_READ | libc::PROT_WRITE, mmap_flags)
-            .map_err(Error::GuestMemoryRegion)?;
+        let address_space = unsafe { 
+            libc::mmap(0 as _, size, libc::PROT_READ | libc::PROT_WRITE, mmap_flags, -1, 0) 
+        };
+        let userspace_addr = address_space as *const u8 as *mut u8;
+        let region = if let Some(fo) = fo {
+            unsafe { 
+                MmapRegionBuilder::new(size)
+                    .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+                    .with_mmap_flags(mmap_flags)
+                    .with_file_offset(fo)
+                    .with_raw_mmap_pointer(userspace_addr)
+                    .build()
+                    .map_err(Error::GuestMemoryRegion)?
+            }
+        } else {
+            unsafe { 
+                MmapRegionBuilder::new(size)
+                    .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
+                    .with_mmap_flags(mmap_flags)
+                    .with_raw_mmap_pointer(userspace_addr)
+                    .build()
+                    .map_err(Error::GuestMemoryRegion)?
+            }
+        };
 
         // Apply NUMA policy if needed.
         if let Some(node) = host_numa_node {
@@ -2224,6 +2253,7 @@ impl MemoryManager {
         host_numa_node: Option<u32>,
         existing_memory_file: Option<File>,
         thp: bool,
+        vm: Option<&Arc<dyn hypervisor::Vm>>,
     ) -> Result<Arc<GuestRegionMmap>, Error> {
         let r = Self::create_ram_region_raw(
             backing_file,
@@ -2237,6 +2267,7 @@ impl MemoryManager {
             host_numa_node,
             existing_memory_file,
             thp,
+            vm,
         )?;
 
         Ok(Arc::new(GuestRegionMmap::new(r, start_addr).ok_or(
@@ -2331,6 +2362,7 @@ impl MemoryManager {
         &mut self,
         start_addr: GuestAddress,
         size: usize,
+        vm: Option<&Arc<dyn hypervisor::Vm>>,
     ) -> Result<Arc<GuestRegionMmap>, Error> {
         // Allocate memory for the region
         let region = MemoryManager::create_ram_region(
@@ -2346,6 +2378,7 @@ impl MemoryManager {
             None,
             None,
             self.thp,
+            vm,
         )?;
 
         // Map it into the guest
@@ -2399,7 +2432,7 @@ impl MemoryManager {
             return Err(Error::InsufficientHotplugRam);
         }
 
-        let region = self.add_ram_region(start_addr, size)?;
+        let region = self.add_ram_region(start_addr, size, None)?;
 
         // Add region to the list of regions associated with the default
         // memory zone.

@@ -23,7 +23,6 @@ use std::os::fd::OwnedFd;
 use std::os::raw;
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use std::os::unix::io::AsRawFd;
-#[cfg(feature = "tdx")]
 use std::os::unix::io::RawFd;
 #[cfg(feature = "tdx")]
 use std::ptr;
@@ -686,7 +685,6 @@ impl KvmVm {
         self.fd.check_extension(c)
     }
 
-    #[cfg(feature = "tdx")]
     /// Creates an anonymous file and returns a file descriptor that refers to it.
     pub fn create_guest_memfd(&self, gmem: kvm_bindings::kvm_create_guest_memfd) -> vm::Result<RawFd> {
         let fd = self.fd.create_guest_memfd(gmem);

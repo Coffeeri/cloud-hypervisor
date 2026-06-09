@@ -2519,7 +2519,7 @@ impl Vm {
             self.memory_manager
                 .lock()
                 .unwrap()
-                .add_ram_region(GuestAddress(section.address), section.size as usize)
+                .add_ram_region(GuestAddress(section.address), section.size as usize, Some(&self.vm))
                 .map_err(Error::AllocatingTdvfMemory)?;
         }
 
