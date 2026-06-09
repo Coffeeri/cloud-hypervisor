@@ -449,8 +449,21 @@ const SELECTION_OFFSET: u64 = 0;
 //  - Reduce the addressable space size by at least 4k to workaround a Linux
 //    bug when the VMM allocates devices at the end of the addressable space
 //  - Windows requires the addressable space size to be 64k aligned
-fn mmio_address_space_size(phys_bits: u8) -> u64 {
-    (1 << phys_bits) - (1 << 16)
+fn mmio_address_space_size(phys_bits: u8, tdx_enabled: bool) -> u64 {
+    #[cfg(feature = "tdx")]
+    if tdx_enabled {
+        // In TDX, the guest GPA space is split at bit (phys_bits-1): addresses
+        // below that bit are "private" GPAs, above are "shared" GPAs.  KVM
+        // strips the shared bit before reporting KVM_EXIT_MMIO to userspace,
+        // so all device BARs must be allocated *below* the shared bit boundary
+        // so that the stripped GPA still matches the address registered on the
+        // mmio_bus.  Cap the usable MMIO address space at (1<<(phys_bits-1)).
+        let shared_bit = 1u64 << (phys_bits - 1);
+        return shared_bit - (1u64 << 16);
+    }
+    #[cfg(not(feature = "tdx"))]
+    let _ = tdx_enabled;
+    (1u64 << phys_bits) - (1u64 << 16)
 }
 
 // The `statfs` function can get information of hugetlbfs, and the hugepage size is in the
@@ -1687,7 +1700,7 @@ impl MemoryManager {
 
         let user_provided_zones = config.size == 0;
 
-        let mmio_address_space_size = mmio_address_space_size(phys_bits);
+        let mmio_address_space_size = mmio_address_space_size(phys_bits, tdx_enabled);
         debug_assert_eq!(
             (((mmio_address_space_size) >> 16) << 16),
             mmio_address_space_size
