@@ -1591,6 +1591,11 @@ fn update_cpuid_topology(
         u32::from(threads_per_core),
     );
     CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(0), CpuidReg::ECX, 1 << 8);
+    // EDX must be set per-vCPU: all subleaves of leaf 0xb return the same x2APIC ID in EDX.
+    // OVMF's AP loop calls TDVMCALL(CPUID(0xb, 0)) to obtain its APIC ID, then compares it
+    // against the apic_id written by Linux into the ACPI wakeup mailbox.  Without this, the
+    // AP always reads EDX=0 (the inherited host value) and never processes the wakeup command.
+    CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(0), CpuidReg::EDX, x2apic_id);
 
     CpuidPatch::set_cpuid_reg(cpuid, 0xb, Some(1), CpuidReg::EAX, die_width);
     CpuidPatch::set_cpuid_reg(
