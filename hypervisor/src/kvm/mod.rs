@@ -686,6 +686,13 @@ impl KvmVm {
         self.fd.check_extension(c)
     }
 
+    #[cfg(feature = "tdx")]
+    /// Creates an anonymous file and returns a file descriptor that refers to it.
+    pub fn create_guest_memfd(&self, gmem: kvm_bindings::kvm_create_guest_memfd) -> vm::Result<RawFd> {
+        let fd = self.fd.create_guest_memfd(gmem);
+        Ok(fd.unwrap())
+    }
+
     #[cfg(target_arch = "x86_64")]
     /// Translates the MSI extended destination ID bits according to the logic
     /// found in the Linux kernel's KVM MSI handling in kvm_msi_to_lapic_irq()/x86_msi_msg_get_destid():

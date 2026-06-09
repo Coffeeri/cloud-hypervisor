@@ -49,6 +49,10 @@ use vm_migration::{
     UffdError,
 };
 use vmm_sys_util::eventfd::EventFd;
+#[cfg(feature = "tdx")]
+use kvm_bindings::kvm_create_guest_memfd;
+#[cfg(feature = "tdx")]
+use kvm_ioctls::Cap;
 
 use crate::config::MemoryRestoreMode;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -2010,6 +2014,29 @@ impl MemoryManager {
         let f = unsafe { File::from_raw_fd(fd) };
         f.set_len(size as u64).map_err(Error::SharedFileSetLen)?;
 
+        Ok(FileOffset::new(f, 0))
+    }
+
+    fn create_guest_memfd_file(
+        vm: &Arc<dyn hypervisor::Vm>,
+        size: usize,
+    ) -> Result<FileOffset, Error> {
+        let kvm_vm = vm.as_any().downcast_ref::<hypervisor::kvm::KvmVm>().unwrap();
+        if !kvm_vm.check_extension(Cap::GuestMemfd) || !kvm_vm.check_extension(Cap::UserMemory2) {
+            return Err(Error::MemoryRangeAllocation);
+        }
+
+        let gmem = kvm_create_guest_memfd {
+            size: size as u64,
+            flags: 0,
+            reserved: [0; 6],
+        };
+        let fd: RawFd = kvm_vm.create_guest_memfd(gmem).unwrap();
+
+        // SAFETY: fd is valid
+        let f = unsafe { File::from_raw_fd(fd) };
+        //f.set_len(size as u64).map_err(Error::SharedFileSetLen)?;
+    
         Ok(FileOffset::new(f, 0))
     }
 

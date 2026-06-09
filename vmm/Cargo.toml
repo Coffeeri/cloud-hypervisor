@@ -105,6 +105,8 @@ vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { workspace = true, features = ["with-serde"] }
 zbus = { version = "5.15.0", optional = true }
 zerocopy = { workspace = true, features = ["alloc", "derive"] }
+kvm-bindings = { workspace = true, features = ["serde"] }
+kvm-ioctls = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
