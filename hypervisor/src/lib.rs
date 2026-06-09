@@ -40,7 +40,7 @@ mod hypervisor;
 mod vm;
 
 /// CPU related module
-mod cpu;
+pub mod cpu;
 
 /// Device related module
 mod device;

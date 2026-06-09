@@ -1044,7 +1044,7 @@ pub fn configure_vcpu(
         if entry.function == 1 {
             entry.ebx &= 0xffffff;
             entry.ebx |= x2apic_id << 24;
-            // TODO: workaround to enable x2apic 
+            // TODO: workaround to enable x2apic
             entry.ecx |= 0x200000;
             apic_id_patched = true;
             if matches!(cpu_vendor, CpuVendor::Intel) {
@@ -1064,9 +1064,9 @@ pub fn configure_vcpu(
         }
         if entry.function == 0x8000_0008 {
             /* 64 bit processor */
-            // TODO: workaround to enable 5-level paging, which is required for supporting more than 512TB of physical memory. 
-             //entry.eax |= (cpu_x86_virtual_addr_width(env) << 8);
-             entry.eax |= 52 << 16;
+            // TODO: workaround to enable 5-level paging, which is required for supporting more than 512TB of physical memory.
+            //entry.eax |= (cpu_x86_virtual_addr_width(env) << 8);
+            entry.eax |= 52 << 16;
         }
     }
     assert!(apic_id_patched);

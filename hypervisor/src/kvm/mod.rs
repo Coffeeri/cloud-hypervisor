@@ -1569,40 +1569,6 @@ impl vm::Vm for KvmVm {
             .map_err(vm::HypervisorVmError::FinalizeTdx)
     }
 
-    /// Initialize memory regions for the TDX VM
-    ///
-    /// # Safety
-    ///
-    /// `host_address` must be valid for `size` bytes
-    #[cfg(feature = "tdx")]
-    unsafe fn tdx_init_memory_region(
-        &self,
-        host_address: *mut u8,
-        guest_address: u64,
-        size: usize,
-        measure: bool,
-    ) -> vm::Result<()> {
-        #[repr(C)]
-        struct TdxInitMemRegion {
-            host_address: u64,
-            guest_address: u64,
-            pages: u64,
-        }
-        let data = TdxInitMemRegion {
-            host_address: host_address as _,
-            guest_address,
-            pages: (size / 4096).try_into().unwrap(),
-        };
-
-        tdx_command(
-            &self.fd.as_raw_fd(),
-            TdxCommand::InitMemRegion,
-            u32::from(measure),
-            (&raw const data).cast(),
-        )
-        .map_err(vm::HypervisorVmError::InitMemRegionTdx)
-    }
-
     /// Downcast to the underlying KvmVm type
     fn as_any(&self) -> &dyn Any {
         self

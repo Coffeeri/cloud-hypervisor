@@ -485,7 +485,7 @@ macro_rules! round_up {
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     // The hypervisor abstracted CPU.
-    vcpu: Box<dyn hypervisor::Vcpu>,
+    pub vcpu: Box<dyn hypervisor::Vcpu>,
     id: u32,
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
