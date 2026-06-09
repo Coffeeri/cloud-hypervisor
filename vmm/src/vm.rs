@@ -479,11 +479,23 @@ impl VmOpsHandler {
         size: u64,
         to_private: bool,
     ) -> result::Result<(), HypervisorVmError> {
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return Err(HypervisorVmError::UnknownTdxVmCall);
+        }
+        let page_size = page_size as u64;
+        if size == 0 || start % page_size != 0 || size % page_size != 0 {
+            return Err(HypervisorVmError::UnknownTdxVmCall);
+        }
+        let end = start
+            .checked_add(size)
+            .ok_or(HypervisorVmError::UnknownTdxVmCall)?;
+
         for region in self.guest_ram_mappings.read().unwrap().iter() {
             let region_start = region.gpa;
             let region_end = region.gpa + region.size;
 
-            if region_start <= start && start + size < region_end {
+            if region_start <= start && end <= region_end {
                 let guest_memfd = region.guest_memfd;
                 if guest_memfd.is_none() {
                     /*
@@ -497,9 +509,10 @@ impl VmOpsHandler {
                         return Ok(());
                     } else {
                         error!(
-                            "Convert non guest_memfd backed memory region
-                        ({:x?} HWADDR_PRIx ,+ {:x?} HWADDR_PRIx ) to {:?}",
-                            start, size, to_private
+                            "Convert non guest_memfd backed memory region (0x{:x}, + 0x{:x}) to {}",
+                            start,
+                            size,
+                            if to_private { "private" } else { "shared" }
                         );
                         return Err(HypervisorVmError::UnknownTdxVmCall);
                     }
@@ -528,8 +541,57 @@ impl VmOpsHandler {
                     .set_memory_attributes(attr)
                     .map_err(|e| HypervisorVmError::CreateUserMemory(e.into()))?;
 
-                // ram_block_discard_range
-                // ram_block_discard_guest_memfd_range
+                let backing_page_size = if region.backing_page_size == 0 {
+                    page_size
+                } else {
+                    region.backing_page_size
+                };
+
+                if to_private {
+                    if backing_page_size != page_size {
+                        /*
+                         * Shared memory is backed by hugetlb, which is supposed to be
+                         * pre-allocated and doesn't need to be discarded.
+                         */
+                        return Ok(());
+                    }
+                    // Best-effort discard to mirror QEMU behavior when possible.
+                    if let Some(guest_memfd) = guest_memfd {
+                        let offset = region
+                            .file_offset
+                            .saturating_add(start.saturating_sub(region_start));
+                        let res = unsafe {
+                            libc::fallocate64(
+                                guest_memfd as i32,
+                                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                                offset as i64,
+                                size as i64,
+                            )
+                        };
+                        if res != 0 {
+                            return Err(HypervisorVmError::CreateUserMemory(
+                                std::io::Error::last_os_error().into(),
+                            ));
+                        }
+                    }
+                } else if let Some(guest_memfd) = guest_memfd {
+                    let offset = region
+                        .file_offset
+                        .saturating_add(start.saturating_sub(region_start));
+                    let res = unsafe {
+                        libc::fallocate64(
+                            guest_memfd as i32,
+                            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                            offset as i64,
+                            size as i64,
+                        )
+                    };
+                    if res != 0 {
+                        return Err(HypervisorVmError::CreateUserMemory(
+                            std::io::Error::last_os_error().into(),
+                        ));
+                    }
+                }
 
                 return Ok(());
             }
@@ -1705,9 +1767,9 @@ impl Vm {
     #[cfg(all(feature = "kvm", feature = "sev_snp"))]
     fn reserve_bootloader_regions(memory_manager: &Arc<Mutex<MemoryManager>>) -> Result<()> {
         let mut mm = memory_manager.lock().unwrap();
-        mm.add_ram_region(BOOTLOADER_START, BOOTLOADER_SIZE, None)
+        mm.add_ram_region(BOOTLOADER_START, BOOTLOADER_SIZE, false, None)
             .map_err(Error::MemoryManager)?;
-        mm.add_ram_region(KVM_VMSA_PAGE_ADDRESS, KVM_VMSA_PAGE_SIZE, None)
+        mm.add_ram_region(KVM_VMSA_PAGE_ADDRESS, KVM_VMSA_PAGE_SIZE, false, None)
             .map_err(Error::MemoryManager)?;
         Ok(())
     }

@@ -193,8 +193,10 @@ pub struct GuestRamMapping {
     pub size: u64,
     zone_id: String,
     virtio_mem: bool,
-    file_offset: u64,
+    pub file_offset: u64,
     pub guest_memfd: Option<u64>,
+    #[serde(default)]
+    pub backing_page_size: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1592,6 +1594,12 @@ impl MemoryManager {
                     0
                 };
 
+                let backing_page_size = self
+                    .memory_zones
+                    .get(&zone_id)
+                    .map(|zone| zone.backing_page_size)
+                    .unwrap_or_else(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 });
+
                 self.guest_ram_mappings
                     .write()
                     .unwrap()
@@ -1603,7 +1611,9 @@ impl MemoryManager {
                         virtio_mem,
                         file_offset,
                         guest_memfd,
+                        backing_page_size,
                     });
+
                 self.ram_allocator
                     .allocate(Some(region.start_addr()), region.len(), None)
                     .ok_or(Error::MemoryRangeAllocation)?;
@@ -2459,6 +2469,13 @@ impl MemoryManager {
                 guest_memfd_offset,
             )
         }?;
+
+        let backing_page_size = self
+            .memory_zones
+            .get(DEFAULT_MEMORY_ZONE)
+            .map(|zone| zone.backing_page_size)
+            .unwrap_or_else(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 });
+
         self.guest_ram_mappings
             .write()
             .unwrap()
@@ -2470,6 +2487,7 @@ impl MemoryManager {
                 virtio_mem: false,
                 file_offset: 0,
                 guest_memfd,
+                backing_page_size,
             });
 
         self.add_region(Arc::clone(&region))?;
