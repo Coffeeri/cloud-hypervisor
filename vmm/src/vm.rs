@@ -2807,7 +2807,8 @@ impl Vm {
                         // Create the payload info that will be inserted into
                         // the HOB.
                         payload_info = Some(PayloadInfo {
-                            image_type: PayloadImageType::BzImage,
+                            image_type: PayloadImageType::BzImage as u32,
+                            reserved: 0,
                             entry_point: section.address,
                         });
                     }

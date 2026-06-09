@@ -267,7 +267,8 @@ pub enum PayloadImageType {
 #[repr(C, packed)]
 #[derive(Copy, Clone, Default, Debug)]
 pub struct PayloadInfo {
-    pub image_type: PayloadImageType,
+    pub image_type: u32,
+    pub reserved: u32,
     pub entry_point: u64,
 }
 
