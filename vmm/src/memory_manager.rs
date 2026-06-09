@@ -16,7 +16,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::{cmp, ffi, panic, result, thread, time};
 
 use acpi_tables::{Aml, aml};
@@ -237,7 +237,7 @@ pub struct MemoryManager {
     // Keep track of calls to create_userspace_mapping() for guest RAM.
     // This is useful for getting the dirty pages as we need to know the
     // slots that the mapping is created in.
-    guest_ram_mappings: Vec<GuestRamMapping>,
+    guest_ram_mappings: Arc<RwLock<Vec<GuestRamMapping>>>,
     uffd_handler: Option<UffdHandler>,
 
     pub acpi_address: Option<GuestAddress>,
@@ -1588,14 +1588,17 @@ impl MemoryManager {
                     0
                 };
 
-                self.guest_ram_mappings.push(GuestRamMapping {
-                    gpa: region.start_addr().raw_value(),
-                    size: region.len(),
-                    slot,
-                    zone_id: zone_id.clone(),
-                    virtio_mem,
-                    file_offset,
-                });
+                self.guest_ram_mappings
+                    .write()
+                    .unwrap()
+                    .push(GuestRamMapping {
+                        gpa: region.start_addr().raw_value(),
+                        size: region.len(),
+                        slot,
+                        zone_id: zone_id.clone(),
+                        virtio_mem,
+                        file_offset,
+                    });
                 self.ram_allocator
                     .allocate(Some(region.start_addr()), region.len(), None)
                     .ok_or(Error::MemoryRangeAllocation)?;
@@ -1902,7 +1905,7 @@ impl MemoryManager {
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
             memory_zones,
-            guest_ram_mappings: Vec::new(),
+            guest_ram_mappings: Arc::new(RwLock::new(Vec::new())),
             uffd_handler: None,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
@@ -2444,14 +2447,17 @@ impl MemoryManager {
                 guest_memfd_offset,
             )
         }?;
-        self.guest_ram_mappings.push(GuestRamMapping {
-            gpa: region.start_addr().raw_value(),
-            size: region.len(),
-            slot,
-            zone_id: DEFAULT_MEMORY_ZONE.to_string(),
-            virtio_mem: false,
-            file_offset: 0,
-        });
+        self.guest_ram_mappings
+            .write()
+            .unwrap()
+            .push(GuestRamMapping {
+                gpa: region.start_addr().raw_value(),
+                size: region.len(),
+                slot,
+                zone_id: DEFAULT_MEMORY_ZONE.to_string(),
+                virtio_mem: false,
+                file_offset: 0,
+            });
 
         self.add_region(Arc::clone(&region))?;
 
@@ -2885,7 +2891,7 @@ impl MemoryManager {
     pub fn snapshot_data(&self) -> MemoryManagerSnapshotData {
         MemoryManagerSnapshotData {
             memory_ranges: self.snapshot_memory_ranges.clone(),
-            guest_ram_mappings: self.guest_ram_mappings.clone(),
+            guest_ram_mappings: self.guest_ram_mappings.read().unwrap().to_vec(),
             start_of_device_area: self.start_of_device_area.0,
             boot_ram: self.boot_ram,
             current_ram: self.current_ram,
@@ -2899,7 +2905,7 @@ impl MemoryManager {
 
     pub fn memory_slot_fds(&self) -> HashMap<u32, RawFd> {
         let mut memory_slot_fds = HashMap::new();
-        for guest_ram_mapping in &self.guest_ram_mappings {
+        for guest_ram_mapping in self.guest_ram_mappings.read().unwrap().iter() {
             let slot = guest_ram_mapping.slot;
             let guest_memory = self.guest_memory.memory();
             let file = guest_memory
@@ -2918,7 +2924,7 @@ impl MemoryManager {
     }
 
     pub fn num_guest_ram_mappings(&self) -> u32 {
-        self.guest_ram_mappings.len() as u32
+        self.guest_ram_mappings.read().unwrap().len() as u32
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -2928,7 +2934,7 @@ impl MemoryManager {
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     pub fn coredump_memory_regions(&self, mem_offset: u64) -> CoredumpMemoryRegions {
-        let mut mapping_sorted_by_gpa = self.guest_ram_mappings.clone();
+        let mut mapping_sorted_by_gpa = self.guest_ram_mappings.read().unwrap().clone();
         mapping_sorted_by_gpa.sort_by_key(|m| m.gpa);
 
         let mut mem_offset_in_elf = mem_offset;
@@ -3509,7 +3515,7 @@ impl Migratable for MemoryManager {
     // together in the table if they are contiguous.
     fn dirty_log(&mut self) -> result::Result<MemoryRangeTable, MigratableError> {
         let mut table = MemoryRangeTable::default();
-        for r in &self.guest_ram_mappings {
+        for r in self.guest_ram_mappings.read().unwrap().deref() {
             let vm_dirty_bitmap = self
                 .vm
                 .get_dirty_log(r.slot, r.gpa, r.size)

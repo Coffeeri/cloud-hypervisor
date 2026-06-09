@@ -1570,7 +1570,10 @@ impl vm::Vm for KvmVm {
 
         let mut new_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
-        new_cpuid.resize(TDX_MAX_NR_CPUID_CONFIGS, kvm_bindings::kvm_cpuid_entry2::default());
+        new_cpuid.resize(
+            TDX_MAX_NR_CPUID_CONFIGS,
+            kvm_bindings::kvm_cpuid_entry2::default(),
+        );
 
         #[repr(C)]
         #[derive(Debug)]
