@@ -2786,24 +2786,25 @@ impl Vm {
             layout::APIC_START.raw_value() - layout::MEM_32BIT_DEVICES_START.raw_value(),
         )
         .map_err(Error::PopulateHob)?;
-        let start_of_device_area = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .start_of_device_area()
-            .raw_value();
-        let end_of_device_area = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .end_of_device_area()
-            .raw_value();
-        hob.add_mmio_resource(
-            &mem,
-            start_of_device_area,
-            end_of_device_area - start_of_device_area,
-        )
-        .map_err(Error::PopulateHob)?;
+        // TODO: Skip the adding of the MMIO resource for the device area.
+        // let start_of_device_area = self
+        //     .memory_manager
+        //     .lock()
+        //     .unwrap()
+        //     .start_of_device_area()
+        //     .raw_value();
+        // let end_of_device_area = self
+        //     .memory_manager
+        //     .lock()
+        //     .unwrap()
+        //     .end_of_device_area()
+        //     .raw_value();
+        // hob.add_mmio_resource(
+        //     &mem,
+        //     start_of_device_area,
+        //     end_of_device_area - start_of_device_area,
+        // )
+        // .map_err(Error::PopulateHob)?;
 
         // Loop over the ACPI tables and copy them to the HOB.
 
