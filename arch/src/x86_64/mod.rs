@@ -1044,6 +1044,8 @@ pub fn configure_vcpu(
         if entry.function == 1 {
             entry.ebx &= 0xffffff;
             entry.ebx |= x2apic_id << 24;
+            // TODO: workaround to enable x2apic 
+            entry.ecx |= 0x200000;
             apic_id_patched = true;
             if matches!(cpu_vendor, CpuVendor::Intel) {
                 if !nested {
@@ -1060,8 +1062,19 @@ pub fn configure_vcpu(
             }
             break;
         }
+        if entry.function == 0x8000_0008 {
+            /* 64 bit processor */
+            // TODO: workaround to enable 5-level paging, which is required for supporting more than 512TB of physical memory. 
+             //entry.eax |= (cpu_x86_virtual_addr_width(env) << 8);
+             entry.eax |= 52 << 16;
+        }
     }
     assert!(apic_id_patched);
+
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, Some(0), CpuidReg::EAX, 0x80000008);
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::EBX, 0);
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::ECX, 0);
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::EDX, 0);
 
     update_cpuid_topology(
         &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
@@ -1112,6 +1125,7 @@ pub fn configure_vcpu(
         }
         regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
     }
+    #[cfg(not(feature = "tdx"))]
     interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
     Ok(())
 }
