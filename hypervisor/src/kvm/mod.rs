@@ -212,10 +212,8 @@ use igvm_defs::PAGE_SIZE_4K;
 use kvm_bindings::{
     KVM_MEMORY_ATTRIBUTE_PRIVATE, KVM_X86_SNP_VM, kvm_memory_attributes, kvm_segment as Segment,
 };
-
 #[cfg(not(feature = "sev_snp"))]
 use kvm_bindings::{KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_memory_attributes};
-
 use vm_memory::GuestAddress;
 #[cfg(feature = "sev_snp")]
 use x86_64::sev;

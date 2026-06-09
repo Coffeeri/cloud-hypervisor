@@ -1274,7 +1274,7 @@ impl Vmm {
             &config.lock().unwrap().memory.clone(),
             None,
             phys_bits,
-            #[cfg(feature = "tdx")]
+            // TODO: TDX doesn't support migration currently.
             false,
             Some(&vm_migration_config.memory_manager_data),
             existing_memory_files,
