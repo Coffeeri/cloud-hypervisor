@@ -88,6 +88,8 @@ use vm_migration::{
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+#[cfg(feature = "tdx")]
+use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, kvm_enable_cap};
 
 use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
@@ -643,6 +645,10 @@ impl Vm {
             &numa_nodes,
         )?;
 
+        // TDX relies on KVM_HC_MAP_GPA_RANGE to handle TDG.VP.VMCALL<MapGPA>
+        // KVM_HC_MAP_GPA_RANGE: 12
+        #[cfg(feature = "tdx")]
+        Self::tdx_enable_hypercall(&vm, 1 << 12)?;
         // Perform hypervisor-specific TDX initialization if enabled
         #[cfg(feature = "tdx")]
         Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
@@ -819,6 +825,26 @@ impl Vm {
         )
         .map_err(Error::CpuManager)?;
         Ok(cpu_manager)
+    }
+
+    #[cfg(feature = "tdx")]
+    fn tdx_enable_hypercall(
+        vm: &Arc<dyn hypervisor::Vm>,
+        enable_mask: u64,
+    ) -> Result<()> {
+        let mut cap: kvm_enable_cap = Default::default();
+        cap.cap = KVM_CAP_EXIT_HYPERCALL;
+        cap.flags = 0;
+        cap.args[0] = enable_mask;
+
+        vm.as_any()
+            .downcast_ref::<hypervisor::kvm::KvmVm>()
+            .unwrap()
+            .fd
+            .enable_cap(&cap)
+            .unwrap();
+
+        Ok(())
     }
 
     /// Initialize TDX if enabled.
