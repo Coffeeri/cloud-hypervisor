@@ -212,6 +212,10 @@ use igvm_defs::PAGE_SIZE_4K;
 use kvm_bindings::{
     KVM_MEMORY_ATTRIBUTE_PRIVATE, KVM_X86_SNP_VM, kvm_memory_attributes, kvm_segment as Segment,
 };
+
+#[cfg(not(feature = "sev_snp"))]
+use kvm_bindings::{KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_memory_attributes};
+
 use vm_memory::GuestAddress;
 #[cfg(feature = "sev_snp")]
 use x86_64::sev;
@@ -686,7 +690,10 @@ impl KvmVm {
     }
 
     /// Creates an anonymous file and returns a file descriptor that refers to it.
-    pub fn create_guest_memfd(&self, gmem: kvm_bindings::kvm_create_guest_memfd) -> vm::Result<RawFd> {
+    pub fn create_guest_memfd(
+        &self,
+        gmem: kvm_bindings::kvm_create_guest_memfd,
+    ) -> vm::Result<RawFd> {
         let fd = self.fd.create_guest_memfd(gmem);
         Ok(fd.unwrap())
     }
@@ -1143,6 +1150,8 @@ impl vm::Vm for KvmVm {
         userspace_addr: *mut u8,
         readonly: bool,
         log_dirty_pages: bool,
+        guest_memfd: Option<u64>,
+        guest_memfd_offset: Option<u64>,
     ) -> vm::Result<()> {
         let mut flags = 0;
         if readonly {
@@ -1157,7 +1166,7 @@ impl vm::Vm for KvmVm {
         // Create a per-region guest_memfd when supported.
         // Each region gets its own fd sized exactly to memory_size
         #[cfg(feature = "sev_snp")]
-        let guest_memfd = if let Some(slots) = &self.memory_slots {
+        let guest_memfd_todo = if let Some(slots) = &self.memory_slots {
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             let fd = unsafe {
                 OwnedFd::from_raw_fd(
@@ -1178,26 +1187,31 @@ impl vm::Vm for KvmVm {
                     memory_size: memory_size as u64,
                 },
             );
-            raw_fd
+            Some(raw_fd)
         } else {
-            0
+            None
         };
+
         #[cfg(not(feature = "sev_snp"))]
-        let guest_memfd = 0;
+        let guest_memfd_todo = guest_memfd.map(|val| val as u32);
 
         let mut region = kvm_userspace_memory_region2 {
             slot,
-            flags: self.get_kvm_userspace_memory_region_flag(flags),
+            flags: self.get_kvm_userspace_memory_region_flag(flags)
+                | guest_memfd_todo
+                    .is_some()
+                    .then_some(KVM_MEM_GUEST_MEMFD)
+                    .unwrap_or(0),
             guest_phys_addr,
             memory_size: memory_size as u64,
             userspace_addr: userspace_addr as usize as u64,
             #[cfg(not(target_arch = "riscv64"))]
-            guest_memfd,
-            // Each guest_memfd is per-region and sized to memory_size,
-            // so the region's data always starts at offset 0.
+            guest_memfd: guest_memfd_todo.unwrap_or(0),
+            // TODO: use the guest_memfd_offset.unwrap()
             guest_memfd_offset: 0,
             ..Default::default()
         };
+
         if (region.flags & KVM_MEM_LOG_DIRTY_PAGES) != 0 {
             if (region.flags & KVM_MEM_READONLY) != 0 {
                 return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
@@ -1223,10 +1237,18 @@ impl vm::Vm for KvmVm {
             region.flags = self.get_kvm_userspace_memory_region_flag(0);
         }
 
-        // SAFETY: Safe because caller promised this is safe.
-        unsafe {
-            self.set_user_memory_region(region)
-                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
+        if guest_memfd.is_none() || cfg!(feature = "sev_snp") {
+            // SAFETY: Safe because caller promised this is safe.
+            unsafe {
+                self.set_user_memory_region(region)
+                    .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
+            }
+        } else {
+            unsafe {
+                self.fd
+                    .set_user_memory_region2(region)
+                    .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
+            }
         }
 
         #[cfg(feature = "sev_snp")]
@@ -1240,6 +1262,24 @@ impl vm::Vm for KvmVm {
                 })
                 .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
         }
+
+        #[cfg(not(feature = "sev_snp"))]
+        if guest_memfd.is_some() {
+            let attr = kvm_memory_attributes {
+                address: guest_phys_addr,
+                size: memory_size as u64,
+                attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+                flags: 0,
+            };
+            let ret = self
+                .fd
+                .set_memory_attributes(attr)
+                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()));
+            if ret.is_err() {
+                return ret;
+            }
+        }
+
         Ok(())
     }
 

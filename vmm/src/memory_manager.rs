@@ -10,7 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{MaybeUninit, zeroed};
 use std::num::NonZeroUsize;
-use std::ops::{BitAnd, Not, Sub};
+use std::ops::{BitAnd, Deref, Not, Sub};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,8 @@ use arch::{RegionType, layout};
 use devices::ioapic;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use hypervisor::HypervisorVmError;
+use kvm_bindings::kvm_create_guest_memfd;
+use kvm_ioctls::Cap;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -38,8 +40,7 @@ use vm_allocator::{AddressAllocator, MemorySlotAllocator, SystemAllocator};
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::guest_memory::{Error as MmapError, FileOffset};
-use vm_memory::mmap::MmapRegionError;
-use vm_memory::mmap::MmapRegionBuilder;
+use vm_memory::mmap::{MmapRegionBuilder, MmapRegionError};
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
     GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion,
@@ -50,8 +51,6 @@ use vm_migration::{
     UffdError,
 };
 use vmm_sys_util::eventfd::EventFd;
-use kvm_bindings::kvm_create_guest_memfd;
-use kvm_ioctls::Cap;
 
 use crate::config::MemoryRestoreMode;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -1555,6 +1554,20 @@ impl MemoryManager {
 
         for (zone_id, regions, zone_mergeable) in list {
             for (region, virtio_mem) in regions {
+                let inner_region = region.deref().deref();
+                let file_offset = inner_region.file_offset();
+                let guest_memfd = if let Some(file_offset) = file_offset {
+                    let fd = file_offset.arc().as_raw_fd();
+                    Some(fd as u64)
+                } else {
+                    None
+                };
+                let guest_memfd_offset = if let Some(file_offset) = file_offset {
+                    let start = file_offset.start();
+                    Some(start as u64)
+                } else {
+                    None
+                };
                 // SAFETY: guaranteed by GuestRegionMmap invariants
                 let slot = unsafe {
                     self.create_userspace_mapping(
@@ -1564,6 +1577,8 @@ impl MemoryManager {
                         zone_mergeable,
                         false,
                         self.log_dirty,
+                        guest_memfd,
+                        guest_memfd_offset,
                     )
                 }?;
 
@@ -1628,6 +1643,8 @@ impl MemoryManager {
                     uefi_region.as_ptr(),
                     false,
                     false,
+                    None,
+                    None,
                 )
                 .map_err(Error::CreateUefiFlash)?;
         }
@@ -1719,8 +1736,13 @@ impl MemoryManager {
                 })
                 .collect();
 
-            let (mem_regions, mut memory_zones) =
-                Self::create_memory_regions_from_zones(&ram_regions, &zones, prefault, config.thp, Some(&vm))?;
+            let (mem_regions, mut memory_zones) = Self::create_memory_regions_from_zones(
+                &ram_regions,
+                &zones,
+                prefault,
+                config.thp,
+                Some(&vm),
+            )?;
 
             let mut guest_memory = GuestMemoryMmap::from_arc_regions(mem_regions)
                 .map_err(Error::GuestRegionCollection)?;
@@ -2024,7 +2046,10 @@ impl MemoryManager {
         vm: &Arc<dyn hypervisor::Vm>,
         size: usize,
     ) -> Result<FileOffset, Error> {
-        let kvm_vm = vm.as_any().downcast_ref::<hypervisor::kvm::KvmVm>().unwrap();
+        let kvm_vm = vm
+            .as_any()
+            .downcast_ref::<hypervisor::kvm::KvmVm>()
+            .unwrap();
         if !kvm_vm.check_extension(Cap::GuestMemfd) || !kvm_vm.check_extension(Cap::UserMemory2) {
             return Err(Error::MemoryRangeAllocation);
         }
@@ -2039,7 +2064,7 @@ impl MemoryManager {
         // SAFETY: fd is valid
         let f = unsafe { File::from_raw_fd(fd) };
         //f.set_len(size as u64).map_err(Error::SharedFileSetLen)?;
-    
+
         Ok(FileOffset::new(f, 0))
     }
 
@@ -2105,12 +2130,19 @@ impl MemoryManager {
             None
         };
 
-        let address_space = unsafe { 
-            libc::mmap(0 as _, size, libc::PROT_READ | libc::PROT_WRITE, mmap_flags, -1, 0) 
+        let address_space = unsafe {
+            libc::mmap(
+                0 as _,
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                mmap_flags,
+                -1,
+                0,
+            )
         };
         let userspace_addr = address_space as *const u8 as *mut u8;
         let region = if let Some(fo) = fo {
-            unsafe { 
+            unsafe {
                 MmapRegionBuilder::new(size)
                     .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
                     .with_mmap_flags(mmap_flags)
@@ -2120,7 +2152,7 @@ impl MemoryManager {
                     .map_err(Error::GuestMemoryRegion)?
             }
         } else {
-            unsafe { 
+            unsafe {
                 MmapRegionBuilder::new(size)
                     .with_mmap_prot(libc::PROT_READ | libc::PROT_WRITE)
                     .with_mmap_flags(mmap_flags)
@@ -2381,6 +2413,21 @@ impl MemoryManager {
             vm,
         )?;
 
+        let inner_region = region.deref().deref();
+        let file_offset = inner_region.file_offset();
+        let guest_memfd = if let Some(file_offset) = file_offset {
+            let fd = file_offset.arc().as_raw_fd();
+            Some(fd as u64)
+        } else {
+            None
+        };
+        let guest_memfd_offset = if let Some(file_offset) = file_offset {
+            let start = file_offset.start();
+            Some(start as u64)
+        } else {
+            None
+        };
+
         // Map it into the guest
         // SAFETY: guaranteed by GuestMmapRegion invariants
         let slot = unsafe {
@@ -2393,6 +2440,8 @@ impl MemoryManager {
                     .map_or(self.mergeable, |z| z.mergeable),
                 false,
                 self.log_dirty,
+                guest_memfd,
+                guest_memfd_offset,
             )
         }?;
         self.guest_ram_mappings.push(GuestRamMapping {
@@ -2499,6 +2548,8 @@ impl MemoryManager {
         mergeable: bool,
         readonly: bool,
         log_dirty: bool,
+        guest_memfd: Option<u64>,
+        guest_memfd_offset: Option<u64>,
     ) -> Result<u32, Error> {
         let slot = self.allocate_memory_slot();
 
@@ -2517,6 +2568,8 @@ impl MemoryManager {
                     userspace_addr,
                     readonly,
                     log_dirty,
+                    guest_memfd,
+                    guest_memfd_offset,
                 )
                 .map_err(Error::CreateUserMemoryRegion)?;
         }
