@@ -19,7 +19,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
 use std::{any, cmp, result, str, thread};
@@ -58,7 +58,11 @@ use igvm::IgvmFile;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::SnpPolicy;
 #[cfg(feature = "tdx")]
-use kvm_bindings::{KVM_CAP_EXIT_HYPERCALL, kvm_enable_cap};
+use kvm_bindings::{
+    KVM_CAP_EXIT_HYPERCALL, KVM_MEMORY_ATTRIBUTE_PRIVATE, kvm_enable_cap, kvm_memory_attributes,
+};
+#[cfg(feature = "tdx")]
+use kvm_ioctls::HypercallExit;
 use libc::{SIGWINCH, termios};
 #[cfg(feature = "tdx")]
 use linux_loader::bootparam;
@@ -106,6 +110,8 @@ use crate::igvm::{igvm_loader, parse_igvm};
 use crate::landlock::LandlockError;
 #[cfg(feature = "tdx")]
 use crate::memory_manager;
+#[cfg(feature = "tdx")]
+use crate::memory_manager::GuestRamMapping;
 use crate::memory_manager::{
     Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData, MemoryRangePolicy,
 };
@@ -460,6 +466,92 @@ struct VmOpsHandler {
     #[cfg(target_arch = "x86_64")]
     io_bus: Arc<Bus>,
     mmio_bus: Arc<Bus>,
+    vm: Arc<dyn hypervisor::Vm>,
+    #[cfg(feature = "tdx")]
+    guest_ram_mappings: Arc<RwLock<Vec<GuestRamMapping>>>,
+}
+
+#[cfg(feature = "tdx")]
+impl VmOpsHandler {
+    pub fn convert_memory(
+        &self,
+        start: u64,
+        size: u64,
+        to_private: bool,
+    ) -> result::Result<(), HypervisorVmError> {
+        for region in self.guest_ram_mappings.read().unwrap().iter() {
+            let region_start = region.gpa;
+            let region_end = region.gpa + region.size;
+
+            if region_start <= start && start + size < region_end {
+                let guest_memfd = region.guest_memfd;
+                if guest_memfd.is_none() {
+                    /*
+                     * Because vMMIO region must be shared, guest TD may convert vMMIO
+                     * region to shared explicitly.  Don't complain such case.  See
+                     * memory_region_type() for checking if the region is MMIO region.
+                     */
+                    if !to_private
+                    /*&& self.memory_manager.lock().unwrap().memory_region_is_ram(region)*/
+                    {
+                        return Ok(());
+                    } else {
+                        error!(
+                            "Convert non guest_memfd backed memory region
+                        ({:x?} HWADDR_PRIx ,+ {:x?} HWADDR_PRIx ) to {:?}",
+                            start, size, to_private
+                        );
+                        return Err(HypervisorVmError::UnknownTdxVmCall);
+                    }
+                }
+
+                let attr = if to_private {
+                    kvm_memory_attributes {
+                        address: start,
+                        size: size,
+                        attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+                        flags: 0,
+                    }
+                } else {
+                    kvm_memory_attributes {
+                        address: start,
+                        size: size,
+                        attributes: 0,
+                        flags: 0,
+                    }
+                };
+                self.vm
+                    .as_any()
+                    .downcast_ref::<hypervisor::kvm::KvmVm>()
+                    .unwrap()
+                    .fd
+                    .set_memory_attributes(attr)
+                    .map_err(|e| HypervisorVmError::CreateUserMemory(e.into()))?;
+
+                // ram_block_discard_range
+                // ram_block_discard_guest_memfd_range
+
+                return Ok(());
+            }
+        }
+
+        /*
+         * Ignore converting non-assigned region to shared.
+         *
+         * TDX requires vMMIO region to be shared to inject #VE to guest.
+         * OVMF issues conservatively MapGPA(shared) on 32bit PCI MMIO region,
+         * and vIO-APIC 0xFEC00000 4K page.
+         * OVMF assigns 32bit PCI MMIO region to
+         * [top of low memory: typically 2GB=0xC000000,  0xFC00000)
+         */
+        if !to_private {
+            // Ignore converting non-assigned region to shared is detected.
+            return Ok(());
+        }
+        error!("Error: converting non-assigned region to private is detected.");
+
+        Err(HypervisorVmError::UnknownTdxVmCall)
+    }
 }
 
 impl VmOps for VmOpsHandler {
@@ -522,6 +614,28 @@ impl VmOps for VmOpsHandler {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "tdx")]
+    fn handle_hc_map_gpa_range(
+        &self,
+        exit: HypercallExit,
+    ) -> result::Result<(), HypervisorVmError> {
+        let gpa = exit.args[0];
+        // TODO: Set 0x1000 to TARGET_PAGE_SIZE.
+        let size = exit.args[1] * 0x1000;
+        let attributes = exit.args[2];
+
+        // let kvm_pre_fault_memory_supported = self.vm
+        //   .as_any()
+        //   .downcast_ref::<hypervisor::kvm::KvmVm>()
+        //   .unwrap()
+        //   .check_extension(Cap::KVM_CAP_PRE_FAULT_MEMORY);
+
+        self.convert_memory(gpa, size, (attributes & 1 << 4) != 0)
+            .unwrap();
+
         Ok(())
     }
 }
@@ -621,6 +735,8 @@ impl Vm {
         let stop_on_boot = Self::should_stop_on_boot(&config);
 
         let memory = memory_manager.lock().unwrap().guest_memory();
+        #[cfg(feature = "tdx")]
+        let guest_ram_mappings = memory_manager.lock().unwrap().guest_ram_mappings();
         let io_bus = Arc::new(Bus::new());
         let mmio_bus = Arc::new(Bus::new());
 
@@ -629,6 +745,9 @@ impl Vm {
             #[cfg(target_arch = "x86_64")]
             io_bus: io_bus.clone(),
             mmio_bus: mmio_bus.clone(),
+            vm: vm.clone(),
+            #[cfg(feature = "tdx")]
+            guest_ram_mappings,
         });
 
         // Create CPU manager

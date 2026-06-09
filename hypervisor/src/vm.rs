@@ -22,6 +22,8 @@ use std::sync::Mutex;
 use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::SnpPolicy;
+#[cfg(feature = "tdx")]
+use kvm_ioctls::HypercallExit;
 use thiserror::Error;
 use vmm_sys_util::eventfd::EventFd;
 
@@ -284,6 +286,12 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to get the list of supported MSRs")]
     GetMsrList(#[source] anyhow::Error),
+    ///
+    /// Unknown TDX VM call
+    ///
+    #[cfg(feature = "tdx")]
+    #[error("Unknown TDX VM call")]
+    UnknownTdxVmCall,
 }
 ///
 /// Result type for returning from a function
@@ -509,4 +517,6 @@ pub trait VmOps: Send + Sync {
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<()>;
     #[cfg(target_arch = "x86_64")]
     fn pio_write(&self, port: u64, data: &[u8]) -> Result<()>;
+    #[cfg(feature = "tdx")]
+    fn handle_hc_map_gpa_range(&self, exit: HypercallExit) -> Result<()>;
 }

@@ -187,13 +187,14 @@ impl MemoryZone {
 pub type MemoryZones = HashMap<String, MemoryZone>;
 
 #[derive(Clone, Serialize, Deserialize)]
-struct GuestRamMapping {
+pub struct GuestRamMapping {
     slot: u32,
-    gpa: u64,
-    size: u64,
+    pub gpa: u64,
+    pub size: u64,
     zone_id: String,
     virtio_mem: bool,
     file_offset: u64,
+    pub guest_memfd: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1601,6 +1602,7 @@ impl MemoryManager {
                         zone_id: zone_id.clone(),
                         virtio_mem,
                         file_offset,
+                        guest_memfd,
                     });
                 self.ram_allocator
                     .allocate(Some(region.start_addr()), region.len(), None)
@@ -2467,6 +2469,7 @@ impl MemoryManager {
                 zone_id: DEFAULT_MEMORY_ZONE.to_string(),
                 virtio_mem: false,
                 file_offset: 0,
+                guest_memfd,
             });
 
         self.add_region(Arc::clone(&region))?;
@@ -2524,6 +2527,10 @@ impl MemoryManager {
 
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.guest_memory.clone()
+    }
+
+    pub fn guest_ram_mappings(&self) -> Arc<RwLock<Vec<GuestRamMapping>>> {
+        self.guest_ram_mappings.clone()
     }
 
     pub fn boot_guest_memory(&self) -> GuestMemoryMmap {
