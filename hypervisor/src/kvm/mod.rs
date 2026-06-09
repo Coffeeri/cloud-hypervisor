@@ -1568,32 +1568,33 @@ impl vm::Vm for KvmVm {
     fn tdx_init(&self, cpuid: &[CpuIdEntry], max_vcpus: u32) -> vm::Result<()> {
         const TDX_ATTR_SEPT_VE_DISABLE: usize = 28;
 
-        let mut cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
+        let mut new_cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
-        cpuid.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
+        new_cpuid.resize(TDX_MAX_NR_CPUID_CONFIGS, kvm_bindings::kvm_cpuid_entry2::default());
 
         #[repr(C)]
+        #[derive(Debug)]
         struct TdxInitVm {
             attributes: u64,
-            max_vcpus: u32,
-            padding: u32,
+            xfam: u64,
             mrconfigid: [u64; 6],
             mrowner: [u64; 6],
             mrownerconfig: [u64; 6],
-            cpuid_nent: u32,
-            cpuid_padding: u32,
-            cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; 256],
+            reserved: [u64; 12],
+            cpuid: kvm_cpuid2,
         }
         let data = TdxInitVm {
             attributes: 1 << TDX_ATTR_SEPT_VE_DISABLE,
-            max_vcpus,
-            padding: 0,
+            xfam: 0,
             mrconfigid: [0; 6],
             mrowner: [0; 6],
             mrownerconfig: [0; 6],
-            cpuid_nent: cpuid.len() as u32,
-            cpuid_padding: 0,
-            cpuid_entries: cpuid.as_slice().try_into().unwrap(),
+            reserved: [0; 12],
+            cpuid: kvm_cpuid2 {
+                nent: cpuid.len() as u32,
+                padding: 0,
+                entries: new_cpuid.as_slice().try_into().unwrap(),
+            },
         };
 
         tdx_command(
