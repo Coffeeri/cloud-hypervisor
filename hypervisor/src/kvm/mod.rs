@@ -3567,6 +3567,40 @@ impl cpu::Vcpu for KvmVcpu {
             .map_err(cpu::HypervisorCpuError::InitializeTdx)
     }
 
+    /// Initialize memory regions for this CPU
+    ///
+    /// # Safety
+    ///
+    /// `host_address` must be valid for `size` bytes
+    #[cfg(feature = "tdx")]
+    unsafe fn tdx_init_memory_region(
+        &self,
+        host_address: *mut u8,
+        guest_address: u64,
+        size: usize,
+        measure: bool,
+    ) -> cpu::Result<()> {
+        #[repr(C)]
+        struct TdxInitMemRegion {
+            host_address: u64,
+            guest_address: u64,
+            pages: u64,
+        }
+        let data = TdxInitMemRegion {
+            host_address: host_address as _,
+            guest_address,
+            pages: (size / 4096).try_into().unwrap(),
+        };
+
+        tdx_command(
+            &self.fd.as_raw_fd(),
+            TdxCommand::InitMemRegion,
+            u32::from(measure),
+            &data as *const _ as *const _,
+        )
+        .map_err(cpu::HypervisorCpuError::InitMemRegionTdx)
+    }
+
     ///
     /// Set the "immediate_exit" state
     ///

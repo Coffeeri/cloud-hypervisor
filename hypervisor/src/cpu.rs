@@ -300,6 +300,12 @@ pub enum HypervisorCpuError {
     #[error("Failed to initialize TDX")]
     InitializeTdx(#[source] io::Error),
     ///
+    /// Error initializing the TDX memory region
+    ///
+    #[cfg(feature = "tdx")]
+    #[error("Failed to initialize memory region TDX")]
+    InitMemRegionTdx(#[source] std::io::Error),
+    ///
     /// Unknown TDX VM call
     ///
     #[cfg(feature = "tdx")]
@@ -595,6 +601,21 @@ pub trait Vcpu: Send + Sync {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_init(&self, _hob_address: u64) -> Result<()> {
+        unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    /// Initialize a TDX memory region for this CPU
+    ///
+    /// # Safety
+    ///
+    /// `_host_address` must be valid for `_size` bytes
+    unsafe fn tdx_init_memory_region(
+        &self,
+        _host_address: *mut u8,
+        _guest_address: u64,
+        _size: usize,
+        _measure: bool,
+    ) -> Result<()> {
         unimplemented!()
     }
     ///
