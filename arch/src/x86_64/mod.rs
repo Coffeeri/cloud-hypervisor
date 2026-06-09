@@ -1076,6 +1076,12 @@ pub fn configure_vcpu(
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::ECX, 0);
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::EDX, 0);
 
+    // Set KVMKVMKVM\0\0\0 within CPUID
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, Some(0), CpuidReg::EAX, 0x4000_0200);
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::EBX, 0x4b4d564b);  // KVMK
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::ECX, 0x564b4d56);  // VMKV
+    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::EDX, 0x0000004d);  // M\0\0\0
+
     update_cpuid_topology(
         &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,
     );
