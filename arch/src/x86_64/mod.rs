@@ -682,14 +682,6 @@ pub fn generate_common_cpuid(
         .map_err(Error::CpuidGetSupported)?;
 
     let is_non_host_profile = !matches!(config.profile, CpuProfile::Host);
-    #[cfg(feature = "tdx")]
-    if config.tdx {
-        if is_non_host_profile {
-            // TDX is not supported by CPU profiles other than host for the time being.
-            return Err(Error::CpuProfileTdxIncompatibility.into());
-        }
-        common_cpuid_tdx_configuration(&mut cpuid, hypervisor, vm_fd)?;
-    }
 
     // Copy CPU identification string
     for i in 0x8000_0002..=0x8000_0004 {
@@ -723,12 +715,21 @@ pub fn generate_common_cpuid(
         Vec::new()
     };
 
-    let cpuid_host = required_common_cpuid_updates(
+    let mut cpuid_host = required_common_cpuid_updates(
         cpuid,
         config,
         #[cfg(feature = "kvm")]
         hypervisor.hypervisor_type(),
     );
+
+    #[cfg(feature = "tdx")]
+    if config.tdx {
+        if is_non_host_profile {
+            // TDX is not supported by CPU profiles other than host for the time being.
+            return Err(Error::CpuProfileTdxIncompatibility.into());
+        }
+        common_cpuid_tdx_configuration(&mut cpuid_host, hypervisor, vm_fd)?;
+    }
 
     // If we want to apply a CPU profile we need to check that it remains compatible with `cpuid_host`
     if is_non_host_profile {
@@ -847,6 +848,8 @@ fn required_common_cpuid_updates(
 
     CpuidPatch::patch_cpuid(&mut cpuid, &cpuid_patches);
 
+    let la57_enabled = CpuidPatch::is_feature_enabled(&cpuid, 7, 0, CpuidReg::ECX, 16);
+
     // Update some existing CPUID
     for entry in cpuid.as_mut_slice().iter_mut() {
         #[allow(unused_unsafe)]
@@ -910,9 +913,18 @@ fn required_common_cpuid_updates(
             }
             // Set CPU physical bits and guest physical bits
             0x8000_0008 => {
-                entry.eax = (entry.eax & 0xff00_ff00)
-                    | (config.phys_bits as u32 & 0xff)
-                    | ((config.phys_bits as u32 & 0xff) << 16);
+                // TODO: This is what we do upstream. How does that fit in with this change?
+                // entry.eax = (entry.eax & 0xff00_ff00)
+                //     | (config.phys_bits as u32 & 0xff)
+                //     | ((config.phys_bits as u32 & 0xff) << 16);
+                let virt_addr_width = if la57_enabled { 57 } else { 48 };
+                let mut guest_phys_bits = (entry.eax >> 16) & 0xff;
+                if guest_phys_bits > config.phys_bits as u32 {
+                    guest_phys_bits = config.phys_bits as u32;
+                }
+                entry.eax = (config.phys_bits as u32 & 0xff)
+                    | (virt_addr_width << 8)
+                    | (guest_phys_bits << 16);
             }
             0x4000_0001 => {
                 // Enable KVM_FEATURE_MSI_EXT_DEST_ID. This allows the guest to target
@@ -1032,6 +1044,7 @@ pub fn configure_vcpu(
 
     // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
     let mut cpuid = cpuid;
+    let la57_enabled = CpuidPatch::is_feature_enabled(&cpuid, 7, 0, CpuidReg::ECX, 16);
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0xb, None, CpuidReg::EDX, x2apic_id);
     CpuidPatch::set_cpuid_reg(&mut cpuid, 0x1f, None, CpuidReg::EDX, x2apic_id);
     if matches!(cpu_vendor, CpuVendor::AMD) {
@@ -1052,21 +1065,28 @@ pub fn configure_vcpu(
                     // Disable nested virtualization for Intel
                     entry.ecx &= !(1 << VMX_ECX_BIT);
                 }
-                break;
             }
         }
         if entry.function == 0x8000_0001 {
-            if !nested {
+            if !nested && matches!(cpu_vendor, CpuVendor::AMD) {
                 // Disable the nested virtualization for AMD
                 entry.ecx &= !(1 << SVM_ECX_BIT);
             }
-            break;
         }
         if entry.function == 0x8000_0008 {
             /* 64 bit processor */
+            // TODO: This is what we do upstream. Find out how that fits with this change:
             // TODO: workaround to enable 5-level paging, which is required for supporting more than 512TB of physical memory.
             //entry.eax |= (cpu_x86_virtual_addr_width(env) << 8);
-            entry.eax |= 52 << 16;
+            // entry.eax |= 52 << 16;
+
+            let virt_addr_width = if la57_enabled { 57 } else { 48 };
+            let mut guest_phys_bits = (entry.eax >> 16) & 0xff;
+            let phys_bits = entry.eax & 0xff;
+            if guest_phys_bits > phys_bits {
+                guest_phys_bits = phys_bits;
+            }
+            entry.eax = phys_bits | (virt_addr_width << 8) | (guest_phys_bits << 16);
         }
     }
     assert!(apic_id_patched);
