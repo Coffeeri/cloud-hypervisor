@@ -691,6 +691,12 @@ pub enum DeviceManagerError {
     )]
     BlockMirrorAlreadyActive(String),
 
+    /// Cannot perform given action, as the device is currently performing a block mirroring operation.
+    #[error(
+        "Failed to perform the requested action for the disk with identifier: {0} as it is currently performing a block mirroring operation"
+    )]
+    BlockMirrorActive(String),
+
     /// The block mirroring destination path already exists.
     #[error(
         "The block mirroring destination path already exists for the disk with identifier: {0} at path: {1}"
@@ -4781,16 +4787,20 @@ impl DeviceManager {
         // Release advisory locks by dropping all references.
         // Linux automatically releases all locks of that file if the last open FD is closed.
         {
-            let maybe_block_device_index = self
+            if let Some(index) = self
                 .block_devices
                 .iter()
-                .enumerate()
-                .find(|(_, dev)| {
-                    let dev = dev.lock().unwrap();
-                    dev.id() == id
-                })
-                .map(|(i, _)| i);
-            if let Some(index) = maybe_block_device_index {
+                .position(|dev| dev.lock().unwrap().id() == id)
+            {
+                // Deny removal of active mirroring block device.
+                if self.block_devices[index]
+                    .lock()
+                    .unwrap()
+                    .mirror_status()
+                    .is_some()
+                {
+                    return Err(DeviceManagerError::BlockMirrorActive(id.to_string()));
+                }
                 let _ = self.block_devices.swap_remove(index);
             }
         }
@@ -5484,6 +5494,22 @@ impl DeviceManager {
             STEP_DELAY,
             MAX_DELAY,
         );
+    }
+
+    /// Returns an iterator over the active mirrors in the block devices.
+    /// Each item is a tuple of the block device ID and its `MirrorStatus`.
+    pub fn active_block_mirrors(&self) -> impl Iterator<Item = (String, MirrorStatus)> {
+        self.block_devices.iter().filter_map(|dev| {
+            let disk = dev.lock().unwrap();
+            disk.mirror_status().map(|status| (disk.id(), status))
+        })
+    }
+
+    /// Returns true if there is an active mirror in any of the block devices, false otherwise.
+    pub fn any_active_block_mirrors(&self) -> bool {
+        self.block_devices
+            .iter()
+            .any(|dev| dev.lock().unwrap().mirror_status().is_some())
     }
 }
 
