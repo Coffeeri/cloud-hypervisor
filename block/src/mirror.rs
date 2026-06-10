@@ -555,6 +555,11 @@ impl CopyWorker {
         let mut offset = 0;
 
         while offset < total_size {
+            // Return early on cancellation or failure.
+            if self.state.phase() != MirrorPhase::Running {
+                return Ok(());
+            }
+
             let length = max_length.min(total_size - offset) as usize;
             self.copy_block(offset, length)?;
             offset += length as u64;
