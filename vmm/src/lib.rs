@@ -2593,7 +2593,13 @@ impl RequestHandler for Vmm {
 
     fn vm_pause(&mut self) -> result::Result<(), VmError> {
         match self.vm {
-            MaybeVmOwnership::Vmm(ref mut vm) => vm.pause().map_err(VmError::Pause),
+            MaybeVmOwnership::Vmm(ref mut vm) => {
+                if vm.any_active_block_mirrors() {
+                    return Err(VmError::ActiveBlockMirror);
+                }
+
+                vm.pause().map_err(VmError::Pause)
+            }
             MaybeVmOwnership::Migration(_) => Err(VmError::VmMigrating)?,
             MaybeVmOwnership::None => Err(VmError::VmNotRunning)?,
         }
@@ -2625,6 +2631,10 @@ impl RequestHandler for Vmm {
     fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         match self.vm {
             MaybeVmOwnership::Vmm(ref mut vm) => {
+                if vm.any_active_block_mirrors() {
+                    return Err(VmError::ActiveBlockMirror);
+                }
+
                 // Drain console_info so that FDs are not reused
                 let _ = self.console_info.take();
                 vm.snapshot()
@@ -2721,6 +2731,11 @@ impl RequestHandler for Vmm {
             MaybeVmOwnership::Migration(_) => return Err(VmError::VmMigrating),
             MaybeVmOwnership::None => return Err(VmError::VmNotRunning),
         };
+
+        if vm.any_active_block_mirrors() {
+            return Err(VmError::ActiveBlockMirror);
+        }
+
         // Drain console_info so that the FDs are not reused
         let _ = self.console_info.take();
         let r = vm.shutdown();
@@ -2742,6 +2757,11 @@ impl RequestHandler for Vmm {
             MaybeVmOwnership::Migration(_) => return Err(VmError::VmMigrating),
             MaybeVmOwnership::None => return Err(VmError::VmNotRunning),
         };
+
+        if vm.any_active_block_mirrors() {
+            return Err(VmError::ActiveBlockMirror);
+        }
+
         let config = vm.get_config();
         vm.shutdown()?;
         self.vm = MaybeVmOwnership::None;
@@ -2863,7 +2883,11 @@ impl RequestHandler for Vmm {
         }
 
         match &self.vm {
-            MaybeVmOwnership::Vmm(_vm) => {
+            MaybeVmOwnership::Vmm(vm) => {
+                if vm.any_active_block_mirrors() {
+                    return Err(VmError::ActiveBlockMirror);
+                }
+
                 event!("vm", "deleted");
 
                 // If a VM is booted, we first try to shut it down.
@@ -3369,8 +3393,14 @@ impl RequestHandler for Vmm {
             .context("Invalid send migration configuration")
             .map_err(MigratableError::MigrateSend)?;
 
-        match self.vm {
-            MaybeVmOwnership::Vmm(_) => (),
+        match &self.vm {
+            MaybeVmOwnership::Vmm(vm) => {
+                if vm.any_active_block_mirrors() {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "Cannot start migration with active disk mirrors"
+                    )));
+                }
+            }
             MaybeVmOwnership::Migration(_) => {
                 return Err(MigratableError::MigrateSend(anyhow!(
                     "There is already an ongoing migration"

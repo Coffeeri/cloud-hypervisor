@@ -126,6 +126,8 @@ pub enum Error {
     ConfigChange(#[source] io::Error),
     #[error("Disk resize failed")]
     DiskResize(#[source] BlockError),
+    #[error("Mirror is currently active")]
+    MirrorActive,
     #[error("Failed applying mirror command: {0}")]
     MirrorSwap(String),
 }
@@ -1349,6 +1351,10 @@ impl Block {
             return Err(Error::InvalidSize);
         }
 
+        if self.mirror_handle.is_some() {
+            return Err(Error::MirrorActive);
+        }
+
         self.disk_image
             .resize(new_size)
             .map_err(Error::DiskResize)?;
@@ -1866,6 +1872,12 @@ impl Snapshottable for Block {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        if self.mirror_handle.is_some() {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "Cannot snapshot while mirror is active"
+            )));
+        }
+
         Snapshot::new_from_state(&self.state())
     }
 }
