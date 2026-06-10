@@ -1576,6 +1576,33 @@ impl Block {
         Self::wait_for_mirror_queue_command_acks(op_id, &ack_rx, self.queue_cmd_senders.len())
     }
 
+    pub fn cancel_mirror(&mut self) -> BlockResult<()> {
+        let state = self
+            .mirror_handle
+            .as_ref()
+            .ok_or_else(|| BlockError::from_kind(BlockErrorKind::MirrorNotActive))?
+            .state
+            .clone();
+
+        // Cancellable while running, ready or after a failure.
+        if !matches!(
+            state.phase(),
+            MirrorPhase::Running | MirrorPhase::Ready | MirrorPhase::Failed(_)
+        ) {
+            return Err(BlockError::from_kind(
+                BlockErrorKind::MirrorCompletionInProgress,
+            ));
+        }
+
+        state.transition_to_phase(MirrorPhase::Cancelling);
+        self.revert_queues_to_source()?;
+
+        // Dropping the handle joins the copy worker and drops the destination.
+        drop(self.mirror_handle.take().unwrap());
+
+        Ok(())
+    }
+
     /// Returns a snapshot of the current mirror progress.
     pub fn mirror_status(&self) -> Option<MirrorStatus> {
         self.mirror_handle.as_ref().map(|h| h.state.status())
@@ -1755,6 +1782,13 @@ impl VirtioDevice for Block {
     }
 
     fn reset(&mut self) {
+        // Cancel any active blockdev-mirror.
+        if self.mirror_handle.is_some()
+            && let Err(e) = self.cancel_mirror()
+        {
+            error!("failed to cancel disk mirror on device reset: {e}");
+        }
+
         self.common.reset();
         self.set_writeback_mode(true);
         event!("virtio-device", "reset", "id", &self.id);

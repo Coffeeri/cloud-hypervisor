@@ -50,6 +50,8 @@ pub enum BlockErrorKind {
     MirrorNotReady,
     /// A mirror swap was requested but was unsuccessful.
     MirrorSwap,
+    /// A mirror completion is already in progress.
+    MirrorCompletionInProgress,
 }
 
 impl Display for BlockErrorKind {
@@ -66,6 +68,7 @@ impl Display for BlockErrorKind {
             Self::MirrorNotActive => write!(f, "No active mirror for the device"),
             Self::MirrorNotReady => write!(f, "Mirror is not yet ready, cannot complete"),
             Self::MirrorSwap => write!(f, "Failed to swap AsyncIO in virtqueue worker for mirror"),
+            Self::MirrorCompletionInProgress => write!(f, "Mirror completion already in progress"),
         }
     }
 }
