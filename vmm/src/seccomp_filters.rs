@@ -960,6 +960,7 @@ fn vcpu_thread_rules(
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         (libc::SYS_unlinkat, vec![]),
         (libc::SYS_writev, vec![]),
+        (libc::SYS_fallocate, vec![]),
     ])
 }
 
