@@ -826,13 +826,14 @@ impl Vm {
             &numa_nodes,
         )?;
 
-        // TDX relies on KVM_HC_MAP_GPA_RANGE to handle TDG.VP.VMCALL<MapGPA>
-        // KVM_HC_MAP_GPA_RANGE: 12
         #[cfg(feature = "tdx")]
-        Self::tdx_enable_hypercall(&vm, 1 << 12)?;
-        // Perform hypervisor-specific TDX initialization if enabled
-        #[cfg(feature = "tdx")]
-        Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
+        if config.lock().unwrap().is_tdx_enabled() {
+            // TDX relies on KVM_HC_MAP_GPA_RANGE to handle TDG.VP.VMCALL<MapGPA>
+            // KVM_HC_MAP_GPA_RANGE: 12
+            Self::tdx_enable_hypercall(&vm, 1 << 12)?;
+            // Perform hypervisor-specific TDX initialization if enabled
+            Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
+        }
 
         // Create device manager
         let device_manager = Self::create_device_manager(
