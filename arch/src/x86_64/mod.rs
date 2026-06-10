@@ -14,8 +14,6 @@ pub mod regs;
 
 #[cfg(feature = "tdx")]
 pub mod tdx;
-#[cfg(feature = "tdx")]
-use std::os::fd::RawFd;
 
 mod arch_capabilities_checks;
 mod helpers;
@@ -27,6 +25,8 @@ mod smbios;
 use std::arch::x86_64;
 
 use helpers::{deserialize_u32_hex, serialize_u32_hex};
+#[cfg(feature = "tdx")]
+use hypervisor::HypervisorVmError;
 use hypervisor::arch::x86::{CPUID_FLAG_VALID_INDEX, CpuIdEntry, VcpuMsrConfigUpdate};
 use hypervisor::{CpuVendor, HypervisorCpuError, HypervisorError};
 use linux_loader::loader::bootparam::{boot_params, setup_header};
@@ -206,8 +206,8 @@ pub enum Error {
 
     /// Error retrieving TDX capabilities through the hypervisor (kvm/mshv) API
     #[cfg(feature = "tdx")]
-    #[error("Error retrieving TDX capabilities through the hypervisor API")]
-    TdxCapabilities(#[source] HypervisorError),
+    #[error("Error retrieving TDX capabilities through the VM API")]
+    TdxCapabilities(#[source] HypervisorVmError),
 
     /// Failed to configure E820 map for bzImage
     #[error("Failed to configure E820 map for bzImage")]
@@ -652,7 +652,7 @@ impl CpuidFeatureEntry {
 pub fn generate_common_cpuid(
     hypervisor: &dyn hypervisor::Hypervisor,
     config: &CpuidConfig,
-    #[cfg(feature = "tdx")] vm_fd: Option<&RawFd>,
+    #[cfg(feature = "tdx")] vm: Option<&dyn hypervisor::Vm>,
 ) -> super::Result<Vec<CpuIdEntry>> {
     #[allow(unused_unsafe)]
     // SAFETY: cpuid called with valid leaves
@@ -728,12 +728,12 @@ pub fn generate_common_cpuid(
             // TDX is not supported by CPU profiles other than host for the time being.
             return Err(Error::CpuProfileTdxIncompatibility.into());
         }
-        let vm_fd = vm_fd.ok_or_else(|| {
-            Error::TdxCapabilities(HypervisorError::InvalidVmFd(
-                "VM fd is required to get TDX capabilities".to_string(),
-            ))
+        let vm = vm.ok_or_else(|| {
+            Error::TdxCapabilities(HypervisorVmError::InitializeTdx(std::io::Error::other(
+                "Missing VM instance for TDX CPUID generation",
+            )))
         })?;
-        common_cpuid_tdx_configuration(&mut cpuid_host, hypervisor, vm_fd)?;
+        common_cpuid_tdx_configuration(&mut cpuid_host, vm)?;
     }
 
     // If we want to apply a CPU profile we need to check that it remains compatible with `cpuid_host`
@@ -1019,16 +1019,12 @@ fn required_common_cpuid_updates(
 #[cfg(feature = "tdx")]
 fn common_cpuid_tdx_configuration(
     cpuid: &mut Vec<CpuIdEntry>,
-    hypervisor: &dyn hypervisor::Hypervisor,
-    vm_fd: &RawFd,
+    vm: &dyn hypervisor::Vm,
 ) -> super::Result<()> {
-    let caps = hypervisor
-        .tdx_capabilities(vm_fd)
-        .map_err(Error::TdxCapabilities)?;
+    let caps = vm.tdx_capabilities().map_err(Error::TdxCapabilities)?;
     info!("TDX capabilities {caps:#?}");
     // TODO: Better error handling
-    hypervisor
-        .tdx_filter_cpuid(cpuid, &caps)
+    vm.tdx_filter_cpuid(cpuid, &caps)
         .map_err(Error::TdxCapabilities)
         .map_err(Into::into)
 }

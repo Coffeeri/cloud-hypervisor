@@ -929,11 +929,6 @@ impl CpuManager {
 
         #[cfg(target_arch = "x86_64")]
         let cpuid = {
-            #[cfg(feature = "tdx")]
-            let kvm_vm = vm
-                .as_any()
-                .downcast_ref::<hypervisor::kvm::KvmVm>()
-                .unwrap();
             let phys_bits = physical_bits(hypervisor.as_ref(), config.max_phys_bits);
             arch::generate_common_cpuid(
                 hypervisor.as_ref(),
@@ -946,7 +941,7 @@ impl CpuManager {
                     profile: config.profile,
                 },
                 #[cfg(feature = "tdx")]
-                Some(&kvm_vm.fd.as_raw_fd()),
+                Some(vm.as_ref()),
             )
             .map_err(Error::CommonCpuId)?
         };

@@ -1560,6 +1560,55 @@ impl vm::Vm for KvmVm {
     }
 
     ///
+    /// Retrieve TDX capabilities
+    ///
+    #[cfg(feature = "tdx")]
+    fn tdx_capabilities(&self) -> vm::Result<TdxCapabilities> {
+        let data = TdxCapabilities::default();
+
+        tdx_command(
+            &self.fd.as_raw_fd(),
+            TdxCommand::Capabilities,
+            0,
+            &data as *const _ as *const _,
+        )
+        .map_err(vm::HypervisorVmError::InitializeTdx)?;
+
+        Ok(data)
+    }
+
+    ///
+    /// Filter TDX capabilities with CPUID
+    ///
+    #[cfg(feature = "tdx")]
+    fn tdx_filter_cpuid(
+        &self,
+        cpuids: &mut Vec<CpuIdEntry>,
+        tdx_capabilities: &TdxCapabilities,
+    ) -> vm::Result<()> {
+        let host_cpuids = cpuids.clone();
+        let mut nent = 0;
+        for host_entry in host_cpuids.iter() {
+            if let Some(entry) = cpuid_find_entry(
+                &tdx_capabilities.cpuid,
+                host_entry.function,
+                host_entry.index,
+            ) {
+                cpuids[nent].function = host_entry.function;
+                cpuids[nent].index = host_entry.index;
+                cpuids[nent].flags = host_entry.flags;
+                cpuids[nent].eax = host_entry.eax & entry.eax;
+                cpuids[nent].ebx = host_entry.ebx & entry.ebx;
+                cpuids[nent].ecx = host_entry.ecx & entry.ecx;
+                cpuids[nent].edx = host_entry.edx & entry.edx;
+                nent += 1;
+            }
+        }
+        cpuids.truncate(nent);
+        Ok(())
+    }
+
+    ///
     /// Initialize TDX for this VM
     ///
     #[cfg(feature = "tdx")]
@@ -1943,54 +1992,6 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     ///
     fn get_host_ipa_limit(&self) -> i32 {
         self.kvm.get_host_ipa_limit()
-    }
-
-    ///
-    /// filter TDX capabilities with CPUID
-    ///
-    #[cfg(feature = "tdx")]
-    fn tdx_filter_cpuid(
-        &self,
-        cpuids: &mut Vec<CpuIdEntry>,
-        tdx_capabilities: &TdxCapabilities,
-    ) -> hypervisor::Result<()> {
-        // TODO: This does not make much sense
-        // A vector is being built, not used and then dropped again.
-        // The only observable effect of this function is that the input vector
-        // is possibly truncated
-        let host_cpuids = cpuids.clone();
-        let mut nent = 0;
-        for host_entry in host_cpuids.iter() {
-            if let Some(entry) = cpuid_find_entry(
-                &tdx_capabilities.cpuid,
-                host_entry.function,
-                host_entry.index,
-            ) {
-                cpuids[nent].function = host_entry.function;
-                cpuids[nent].index = host_entry.index;
-                cpuids[nent].flags = host_entry.flags;
-                cpuids[nent].eax = host_entry.eax & entry.eax;
-                cpuids[nent].ebx = host_entry.ebx & entry.ebx;
-                cpuids[nent].ecx = host_entry.ecx & entry.ecx;
-                cpuids[nent].edx = host_entry.edx & entry.edx;
-                nent += 1;
-            }
-        }
-        cpuids.truncate(nent);
-        return Ok(());
-    }
-
-    ///
-    /// Retrieve TDX capabilities
-    ///
-    #[cfg(feature = "tdx")]
-    fn tdx_capabilities(&self, vm_fd: &RawFd) -> hypervisor::Result<TdxCapabilities> {
-        let data = TdxCapabilities::default();
-
-        tdx_command(vm_fd, TdxCommand::Capabilities, 0, (&raw const data).cast())
-            .map_err(|e| hypervisor::HypervisorError::TdxCapabilities(e.into()))?;
-
-        Ok(data)
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

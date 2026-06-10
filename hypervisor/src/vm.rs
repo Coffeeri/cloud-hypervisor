@@ -38,6 +38,8 @@ use crate::arch::x86::CpuIdEntry;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::VcpuMsrConfigUpdate;
 use crate::cpu::Vcpu;
+#[cfg(feature = "tdx")]
+use crate::kvm::TdxCapabilities;
 use crate::{ClockRestoreMode, ClockState, IoEventAddress, IrqRoutingEntry};
 
 ///
@@ -452,6 +454,20 @@ pub trait Vm: Send + Sync + Any {
     #[cfg(feature = "tdx")]
     /// Initialize TDX on this VM
     fn tdx_init(&self, _cpuid: &[CpuIdEntry], _max_vcpus: u32) -> Result<()> {
+        unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    /// Retrieve TDX capabilities
+    fn tdx_capabilities(&self) -> Result<TdxCapabilities> {
+        unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    /// Retrieve TDX capabilities CPUID entry (flags, eax, ebx, ecx, edx)
+    fn tdx_filter_cpuid(
+        &self,
+        _cpuids: &mut Vec<CpuIdEntry>,
+        _tdx_capabilities: &TdxCapabilities,
+    ) -> Result<()> {
         unimplemented!()
     }
     #[cfg(feature = "tdx")]
