@@ -652,7 +652,7 @@ impl CpuidFeatureEntry {
 pub fn generate_common_cpuid(
     hypervisor: &dyn hypervisor::Hypervisor,
     config: &CpuidConfig,
-    #[cfg(feature = "tdx")] vm_fd: &RawFd,
+    #[cfg(feature = "tdx")] vm_fd: Option<&RawFd>,
 ) -> super::Result<Vec<CpuIdEntry>> {
     #[allow(unused_unsafe)]
     // SAFETY: cpuid called with valid leaves
@@ -728,6 +728,11 @@ pub fn generate_common_cpuid(
             // TDX is not supported by CPU profiles other than host for the time being.
             return Err(Error::CpuProfileTdxIncompatibility.into());
         }
+        let vm_fd = vm_fd.ok_or_else(|| {
+            Error::TdxCapabilities(HypervisorError::InvalidVmFd(
+                "VM fd is required to get TDX capabilities".to_string(),
+            ))
+        })?;
         common_cpuid_tdx_configuration(&mut cpuid_host, hypervisor, vm_fd)?;
     }
 
@@ -1039,6 +1044,7 @@ pub fn configure_vcpu(
     topology: (u16, u16, u16, u16),
     nested: bool,
     setup_registers: bool,
+    #[cfg(feature = "tdx")] tdx_enabled: bool,
 ) -> super::Result<()> {
     let x2apic_id = get_x2apic_id(id, Some(topology));
 
@@ -1057,8 +1063,11 @@ pub fn configure_vcpu(
         if entry.function == 1 {
             entry.ebx &= 0xffffff;
             entry.ebx |= x2apic_id << 24;
-            // TODO: workaround to enable x2apic
-            entry.ecx |= 0x200000;
+            #[cfg(feature = "tdx")]
+            if tdx_enabled == true {
+                // TDX vCPUs are launched with xAPIC mode, so we need to set the x2APIC bit in CPUID to make sure the guest OS can enable x2APIC mode and use the correct APIC ID.
+                entry.ecx |= 0x200000;
+            }
             apic_id_patched = true;
             if matches!(cpu_vendor, CpuVendor::Intel) {
                 if !nested {
@@ -1091,16 +1100,18 @@ pub fn configure_vcpu(
     }
     assert!(apic_id_patched);
 
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, Some(0), CpuidReg::EAX, 0x80000008);
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::EBX, 0);
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::ECX, 0);
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::EDX, 0);
-
-    // Set KVMKVMKVM\0\0\0 within CPUID
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, Some(0), CpuidReg::EAX, 0x4000_0200);
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::EBX, 0x4b4d564b); // KVMK
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::ECX, 0x564b4d56); // VMKV
-    CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::EDX, 0x0000004d); // M\0\0\0
+    #[cfg(feature = "tdx")]
+    if tdx_enabled == true {
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, Some(0), CpuidReg::EAX, 0x80000008);
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::EBX, 0);
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::ECX, 0);
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x8000_0000, None, CpuidReg::EDX, 0);
+        // Set KVMKVMKVM\0\0\0 within CPUID
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, Some(0), CpuidReg::EAX, 0x4000_0200);
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::EBX, 0x4b4d564b); // KVMK
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::ECX, 0x564b4d56); // VMKV
+        CpuidPatch::set_cpuid_reg(&mut cpuid, 0x4000_0200, None, CpuidReg::EDX, 0x0000004d); // M\0\0\0
+    }
 
     update_cpuid_topology(
         &mut cpuid, topology.0, topology.1, topology.2, topology.3, cpu_vendor, id,

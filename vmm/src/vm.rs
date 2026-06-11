@@ -3573,7 +3573,7 @@ impl Snapshottable for Vm {
                 },
                 #[cfg(feature = "tdx")]
                 // Snapshot not possible with TDX VM
-                &(u32::MAX as std::os::unix::io::RawFd),
+                None,
             )
             .context("Error generating common cpuid")
             .map_err(MigratableError::MigrateReceive)?

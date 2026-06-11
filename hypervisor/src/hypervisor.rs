@@ -94,6 +94,11 @@ pub enum HypervisorError {
     ///
     #[error("Unsupported VmType")]
     UnsupportedVmType(),
+    ///
+    /// Invalid VM file descriptor
+    ///
+    #[error("Invalid VM file descriptor: {0}")]
+    InvalidVmFd(String),
 
     ///
     /// The attempt to enable AMX tile state components failed
