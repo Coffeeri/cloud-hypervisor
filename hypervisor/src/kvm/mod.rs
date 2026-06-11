@@ -76,6 +76,8 @@ pub use crate::riscv64::{
 #[cfg(target_arch = "riscv64")]
 use crate::riscv64_reg_id;
 // x86_64 dependencies
+#[cfg(feature = "tdx")]
+mod tdx;
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
@@ -160,6 +162,13 @@ use crate::RegList;
 use crate::TimerState;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::{get_cntfrq, regs};
+#[cfg(feature = "tdx")]
+use crate::kvm::tdx::{
+    KvmTdxCmd, KvmTdxExit, KvmTdxInitMemRegion, KvmTdxInitVm, TDX_MAX_NR_CPUID_CONFIGS, TdxCommand,
+    kvm_cpuid2,
+};
+#[cfg(feature = "tdx")]
+pub use crate::kvm::tdx::{TdxExitDetails, TdxExitStatus, kvm_tdx_capabilities};
 #[cfg(target_arch = "x86_64")]
 use crate::kvm::x86_64::XsaveStateError;
 
@@ -279,128 +288,6 @@ const TDG_VP_VMCALL_INVALID_OPERAND: u64 = 0x8000000000000000;
 
 #[cfg(feature = "tdx")]
 ioctl_iowr_nr!(KVM_MEMORY_ENCRYPT_OP, KVMIO, 0xba, raw::c_ulong);
-
-#[cfg(feature = "tdx")]
-#[repr(u32)]
-enum TdxCommand {
-    Capabilities = 0,
-    InitVm,
-    InitVcpu,
-    InitMemRegion,
-    Finalize,
-}
-
-#[cfg(feature = "tdx")]
-pub enum TdxExitDetails {
-    GetQuote,
-    SetupEventNotifyInterrupt,
-}
-
-#[cfg(feature = "tdx")]
-pub enum TdxExitStatus {
-    Success,
-    InvalidOperand,
-}
-
-#[cfg(feature = "tdx")]
-const TDX_MAX_NR_CPUID_CONFIGS: usize = 80;
-
-#[cfg(feature = "tdx")]
-#[repr(C)]
-#[derive(Debug)]
-pub struct kvm_cpuid2 {
-    pub nent: u32,
-    pub padding: u32,
-    pub entries: [kvm_bindings::kvm_cpuid_entry2; TDX_MAX_NR_CPUID_CONFIGS],
-}
-#[cfg(feature = "tdx")]
-impl Default for kvm_cpuid2 {
-    fn default() -> Self {
-        Self {
-            nent: TDX_MAX_NR_CPUID_CONFIGS as u32,
-            padding: 0,
-            entries: [kvm_bindings::kvm_cpuid_entry2::default(); TDX_MAX_NR_CPUID_CONFIGS],
-        }
-    }
-}
-#[cfg(feature = "tdx")]
-#[repr(C)]
-#[derive(Debug)]
-pub struct TdxCapabilities {
-    pub supported_attrs: u64,
-    pub supported_xfam: u64,
-
-    pub kernel_tdvmcallinfo_1_r11: u64,
-    pub user_tdvmcallinfo_1_r11: u64,
-    pub kernel_tdvmcallinfo_1_r12: u64,
-    pub user_tdvmcallinfo_1_r12: u64,
-
-    pub reserved: [u64; 250],
-
-    pub cpuid: kvm_cpuid2,
-}
-#[cfg(feature = "tdx")]
-impl Default for TdxCapabilities {
-    fn default() -> Self {
-        Self {
-            supported_attrs: 0,
-            supported_xfam: 0,
-            kernel_tdvmcallinfo_1_r11: 0,
-            user_tdvmcallinfo_1_r11: 0,
-            kernel_tdvmcallinfo_1_r12: 0,
-            user_tdvmcallinfo_1_r12: 0,
-            reserved: [0_u64; 250],
-            // Initialize with a default, for example:
-            cpuid: kvm_cpuid2::default(),
-        }
-    }
-}
-
-#[cfg(feature = "tdx")]
-#[derive(Copy, Clone)]
-pub struct KvmTdxExit {
-    pub type_: u32,
-    pub pad: u32,
-    pub u: KvmTdxExitU,
-}
-
-#[cfg(feature = "tdx")]
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub union KvmTdxExitU {
-    pub vmcall: KvmTdxExitVmcall,
-}
-
-#[cfg(feature = "tdx")]
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone, PartialEq)]
-pub struct KvmTdxExitVmcall {
-    pub type_: u64,
-    pub subfunction: u64,
-    pub reg_mask: u64,
-    pub in_r12: u64,
-    pub in_r13: u64,
-    pub in_r14: u64,
-    pub in_r15: u64,
-    pub in_rbx: u64,
-    pub in_rdi: u64,
-    pub in_rsi: u64,
-    pub in_r8: u64,
-    pub in_r9: u64,
-    pub in_rdx: u64,
-    pub status_code: u64,
-    pub out_r11: u64,
-    pub out_r12: u64,
-    pub out_r13: u64,
-    pub out_r14: u64,
-    pub out_r15: u64,
-    pub out_rbx: u64,
-    pub out_rdi: u64,
-    pub out_rsi: u64,
-    pub out_r8: u64,
-    pub out_r9: u64,
-    pub out_rdx: u64,
-}
 
 impl From<kvm_userspace_memory_region2> for UserMemoryRegion {
     fn from(region: kvm_userspace_memory_region2) -> Self {
@@ -1563,11 +1450,11 @@ impl vm::Vm for KvmVm {
     /// Retrieve TDX capabilities
     ///
     #[cfg(feature = "tdx")]
-    fn tdx_capabilities(&self) -> vm::Result<TdxCapabilities> {
-        let data = TdxCapabilities::default();
+    fn tdx_capabilities(&self) -> vm::Result<kvm_tdx_capabilities> {
+        let data = kvm_tdx_capabilities::default();
 
         tdx_command(
-            &self.fd.as_raw_fd(),
+            self.fd.as_raw_fd(),
             TdxCommand::Capabilities,
             0,
             &data as *const _ as *const _,
@@ -1584,7 +1471,7 @@ impl vm::Vm for KvmVm {
     fn tdx_filter_cpuid(
         &self,
         cpuids: &mut Vec<CpuIdEntry>,
-        tdx_capabilities: &TdxCapabilities,
+        tdx_capabilities: &kvm_tdx_capabilities,
     ) -> vm::Result<()> {
         let host_cpuids = cpuids.clone();
         let mut nent = 0;
@@ -1622,18 +1509,7 @@ impl vm::Vm for KvmVm {
             kvm_bindings::kvm_cpuid_entry2::default(),
         );
 
-        #[repr(C)]
-        #[derive(Debug)]
-        struct TdxInitVm {
-            attributes: u64,
-            xfam: u64,
-            mrconfigid: [u64; 6],
-            mrowner: [u64; 6],
-            mrownerconfig: [u64; 6],
-            reserved: [u64; 12],
-            cpuid: kvm_cpuid2,
-        }
-        let data = TdxInitVm {
+        let data = KvmTdxInitVm {
             attributes: 1 << TDX_ATTR_SEPT_VE_DISABLE,
             xfam: 0,
             mrconfigid: [0; 6],
@@ -1648,7 +1524,7 @@ impl vm::Vm for KvmVm {
         };
 
         tdx_command(
-            &self.fd.as_raw_fd(),
+            self.fd.as_raw_fd(),
             TdxCommand::InitVm,
             0,
             (&raw const data).cast(),
@@ -1661,8 +1537,13 @@ impl vm::Vm for KvmVm {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_finalize(&self) -> vm::Result<()> {
-        tdx_command(&self.fd.as_raw_fd(), TdxCommand::Finalize, 0, ptr::null())
-            .map_err(vm::HypervisorVmError::FinalizeTdx)
+        tdx_command(
+            self.fd.as_raw_fd(),
+            TdxCommand::Finalize,
+            0,
+            std::ptr::null(),
+        )
+        .map_err(vm::HypervisorVmError::FinalizeTdx)
     }
 
     /// Downcast to the underlying KvmVm type
@@ -1673,29 +1554,25 @@ impl vm::Vm for KvmVm {
 
 #[cfg(feature = "tdx")]
 fn tdx_command(
-    fd: &RawFd,
+    fd: RawFd,
     command: TdxCommand,
     flags: u32,
     data: *const libc::c_void,
 ) -> io::Result<()> {
-    #[repr(C)]
-    struct TdxIoctlCmd {
-        command: TdxCommand,
-        flags: u32,
-        data: u64,
-        error: u64,
-        unused: u64,
-    }
-    let cmd = TdxIoctlCmd {
-        command,
+    let cmd = KvmTdxCmd {
+        id: command,
         flags,
         data: data as _,
-        error: 0,
-        unused: 0,
+        hw_error: 0,
     };
     // SAFETY: FFI call. All input parameters are valid.
-    let ret =
-        unsafe { ioctl_with_val(fd, KVM_MEMORY_ENCRYPT_OP(), &raw const cmd as raw::c_ulong) };
+    let ret = unsafe {
+        ioctl_with_val(
+            &fd,
+            KVM_MEMORY_ENCRYPT_OP(),
+            &cmd as *const KvmTdxCmd as std::os::raw::c_ulong,
+        )
+    };
 
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -3594,7 +3471,7 @@ impl cpu::Vcpu for KvmVcpu {
         compile_error!("32-bit TDX not supported");
         let hob_address = hob_address as *const _;
 
-        tdx_command(&self.fd.as_raw_fd(), TdxCommand::InitVcpu, 0, hob_address)
+        tdx_command(self.fd.as_raw_fd(), TdxCommand::InitVcpu, 0, hob_address)
             .map_err(cpu::HypervisorCpuError::InitializeTdx)
     }
 
@@ -3611,20 +3488,14 @@ impl cpu::Vcpu for KvmVcpu {
         size: usize,
         measure: bool,
     ) -> cpu::Result<()> {
-        #[repr(C)]
-        struct TdxInitMemRegion {
-            host_address: u64,
-            guest_address: u64,
-            pages: u64,
-        }
-        let data = TdxInitMemRegion {
-            host_address: host_address as _,
-            guest_address,
-            pages: (size / 4096).try_into().unwrap(),
+        let data = KvmTdxInitMemRegion {
+            source_addr: host_address as _,
+            gpa: guest_address,
+            nr_pages: (size / 4096).try_into().unwrap(),
         };
 
         tdx_command(
-            &self.fd.as_raw_fd(),
+            self.fd.as_raw_fd(),
             TdxCommand::InitMemRegion,
             u32::from(measure),
             &data as *const _ as *const _,
