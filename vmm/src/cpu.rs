@@ -242,6 +242,16 @@ pub enum Error {
 }
 pub type Result<T> = result::Result<T, Error>;
 
+#[cfg(feature = "tdx")]
+/// CPUID generation mode for TDX builds.
+///
+/// This enum intentionally replaces a loose `(tdx: bool, vm: &dyn Vm)` pair so
+/// callers cannot express inconsistent states.
+pub enum TdxCpuidMode<'a> {
+    Disabled,
+    Enabled { vm: &'a dyn hypervisor::Vm },
+}
+
 const PR_SCHED_CORE: libc::c_int = 62;
 const PR_SCHED_CORE_GET: libc::c_int = 0;
 const PR_SCHED_CORE_CREATE: libc::c_int = 1;
