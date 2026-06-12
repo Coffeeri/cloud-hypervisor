@@ -396,6 +396,96 @@ pub enum VmExit {
 /// Result type for returning from a function
 ///
 pub type Result<T> = anyhow::Result<T, HypervisorCpuError>;
+
+#[cfg(feature = "tdx")]
+const fn is_supported_page_alignment(alignment: u64) -> bool {
+    alignment == 4096 || alignment == (2_u64 << 20) || alignment == (1_u64 << 30)
+}
+
+#[cfg(feature = "tdx")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageAlignedMemoryAddress<const ALIGNMENT: u64 = 4096>(u64);
+
+#[cfg(feature = "tdx")]
+pub type TdxInitHostPhysAddr = PageAlignedMemoryAddress<4096>;
+
+#[cfg(feature = "tdx")]
+pub type TdxInitGuestPhysAddr = PageAlignedMemoryAddress<4096>;
+
+#[cfg(feature = "tdx")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageAlignedMemorySize<const ALIGNMENT: usize = 4096>(usize);
+
+#[cfg(feature = "tdx")]
+pub type TdxInitMemoryRegionSize = PageAlignedMemorySize<4096>;
+
+#[cfg(feature = "tdx")]
+impl<const ALIGNMENT: u64> PageAlignedMemoryAddress<ALIGNMENT> {
+    pub fn new(addr: u64) -> Result<Self> {
+        if !is_supported_page_alignment(ALIGNMENT) {
+            return Err(HypervisorCpuError::InitMemRegionTdx(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "host physical address alignment {ALIGNMENT} is unsupported; expected 4K, 2MB, or 1GB"
+                ),
+            )));
+        }
+
+        if addr & (ALIGNMENT - 1) != 0 {
+            return Err(HypervisorCpuError::InitMemRegionTdx(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("host physical address 0x{addr:x} is not {ALIGNMENT}-byte aligned"),
+            )));
+        }
+
+        Ok(Self(addr))
+    }
+
+    pub fn from_ptr(addr: *mut u8) -> Result<Self> {
+        Self::new(addr as u64)
+    }
+
+    pub fn raw_value(self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(feature = "tdx")]
+impl<const ALIGNMENT: usize> PageAlignedMemorySize<ALIGNMENT> {
+    pub fn new(size: usize) -> Result<Self> {
+        if !is_supported_page_alignment(ALIGNMENT as u64) {
+            return Err(HypervisorCpuError::InitMemRegionTdx(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "memory region size alignment {ALIGNMENT} is unsupported; expected 4K, 2MB, or 1GB"
+                ),
+            )));
+        }
+
+        if size & (ALIGNMENT - 1) != 0 {
+            return Err(HypervisorCpuError::InitMemRegionTdx(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("memory region size 0x{size:x} is not {ALIGNMENT}-byte aligned"),
+            )));
+        }
+
+        Ok(Self(size))
+    }
+
+    pub fn raw_value(self) -> usize {
+        self.0
+    }
+
+    pub fn nr_pages(self) -> Result<u64> {
+        let pages = self.0 / ALIGNMENT;
+        u64::try_from(pages).map_err(|_| {
+            HypervisorCpuError::InitMemRegionTdx(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("memory region page count {pages} does not fit in u64"),
+            ))
+        })
+    }
+}
 ///
 /// Trait to represent a generic Vcpu
 ///
@@ -611,9 +701,9 @@ pub trait Vcpu: Send + Sync {
     /// `_host_address` must be valid for `_size` bytes
     unsafe fn tdx_init_memory_region(
         &self,
-        _host_address: *mut u8,
-        _guest_address: u64,
-        _size: usize,
+        _host_address: TdxInitHostPhysAddr,
+        _guest_address: TdxInitGuestPhysAddr,
+        _size: TdxInitMemoryRegionSize,
         _measure: bool,
     ) -> Result<()> {
         unimplemented!()
