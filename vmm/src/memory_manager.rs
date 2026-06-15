@@ -187,16 +187,42 @@ impl MemoryZone {
 pub type MemoryZones = HashMap<String, MemoryZone>;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct GuestRamMapping {
+pub(crate) struct GuestRamMapping {
     slot: u32,
-    pub gpa: u64,
-    pub size: u64,
+    gpa: u64,
+    size: u64,
     zone_id: String,
     virtio_mem: bool,
-    pub file_offset: u64,
-    pub guest_memfd: Option<u64>,
+    file_offset: u64,
+    guest_memfd: Option<u64>,
     #[serde(default)]
-    pub backing_page_size: u64,
+    backing_page_size: u64,
+}
+
+impl GuestRamMapping {
+    pub(crate) fn slot(&self) -> u32 {
+        self.slot
+    }
+
+    pub(crate) fn gpa(&self) -> u64 {
+        self.gpa
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub(crate) fn file_offset(&self) -> u64 {
+        self.file_offset
+    }
+
+    pub(crate) fn guest_memfd(&self) -> Option<u64> {
+        self.guest_memfd
+    }
+
+    pub(crate) fn backing_page_size(&self) -> u64 {
+        self.backing_page_size
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2562,7 +2588,7 @@ impl MemoryManager {
         self.guest_memory.clone()
     }
 
-    pub fn guest_ram_mappings(&self) -> Arc<RwLock<Vec<GuestRamMapping>>> {
+    pub(crate) fn guest_ram_mappings(&self) -> Arc<RwLock<Vec<GuestRamMapping>>> {
         self.guest_ram_mappings.clone()
     }
 
