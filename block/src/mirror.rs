@@ -250,6 +250,9 @@ pub struct MirroringAsyncIo {
     /// The optional guard inside each entry blocks the copy worker from touching
     /// the same range until both completions arrive.
     inflight_requests: HashMap<u64, InflightMutatingRequest>,
+    /// Set once this virtqueue worker observes a failure. While true, the
+    /// virtqueue worker forwards only to the source and ignores the destination.
+    source_passthrough: bool,
 }
 impl MirroringAsyncIo {
     #[allow(dead_code)]
@@ -271,6 +274,7 @@ impl MirroringAsyncIo {
             destination,
             state,
             inflight_requests: HashMap::new(),
+            source_passthrough: false,
         });
 
         Ok((async_io, dest_notifier))
@@ -281,6 +285,7 @@ impl MirroringAsyncIo {
     /// needs to cancel to cleanup resources.
     fn fail(&mut self, reason: String) {
         self.state.transition_to_phase(MirrorPhase::Failed(reason));
+        self.source_passthrough = true;
     }
 
     /// Helper that applies an `AsyncIo` request to both source and destination,
@@ -345,6 +350,10 @@ impl AsyncIo for MirroringAsyncIo {
         iovecs: &[iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
+        if self.source_passthrough {
+            return self.source.write_vectored(offset, iovecs, user_data);
+        }
+
         let guard = self
             .state
             .range_locks
@@ -360,6 +369,10 @@ impl AsyncIo for MirroringAsyncIo {
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
+        if self.source_passthrough {
+            return self.source.fsync(user_data);
+        }
+
         self.mirror_request(
             "fsync",
             None, // We dont need a guard here, `fsync()` is not ranged.
@@ -370,6 +383,10 @@ impl AsyncIo for MirroringAsyncIo {
     }
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+        if self.source_passthrough {
+            return self.source.punch_hole(offset, length, user_data);
+        }
+
         let guard = self
             .state
             .range_locks
@@ -385,6 +402,10 @@ impl AsyncIo for MirroringAsyncIo {
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
+        if self.source_passthrough {
+            return self.source.write_zeroes(offset, length, user_data);
+        }
+
         let guard = self
             .state
             .range_locks
@@ -406,6 +427,16 @@ impl AsyncIo for MirroringAsyncIo {
                 Some(inflight_req) => inflight_req.src_completion = Some(result),
                 None => return Some((completion_id, result)), // passthrough read or non-mirrored write completion
             }
+        }
+
+        // After a failure, complete any still-tracked request on the source
+        // result alone, allowing inflight_requests to empty out.
+        if self.source_passthrough {
+            return self
+                .inflight_requests
+                .extract_if(|_, w| w.src_completion.is_some())
+                .next()
+                .map(|(user_data, req)| (user_data, req.src_completion.unwrap()));
         }
 
         // Drain destination completions.
@@ -433,10 +464,18 @@ impl AsyncIo for MirroringAsyncIo {
     }
 
     fn batch_requests_enabled(&self) -> bool {
+        if self.source_passthrough {
+            return self.source.batch_requests_enabled();
+        }
+
         true
     }
 
     fn submit_batch_requests(&mut self, batch_request: &[BatchRequest]) -> AsyncIoResult<()> {
+        if self.source_passthrough {
+            return self.source.submit_batch_requests(batch_request);
+        }
+
         for req in batch_request {
             match req.request_type {
                 RequestType::In => self.read_vectored(req.offset, &req.iovecs, req.user_data)?,
@@ -448,6 +487,10 @@ impl AsyncIo for MirroringAsyncIo {
     }
 
     fn alignment(&self) -> u64 {
+        if self.source_passthrough {
+            return self.source.alignment();
+        }
+
         // Stricter alignment wins. Same iovec goes to both backends.
         self.source.alignment().max(self.destination.alignment())
     }
