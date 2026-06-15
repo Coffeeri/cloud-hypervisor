@@ -279,6 +279,16 @@ struct TdPayload {
     payload_info: PayloadInfo,
 }
 
+impl PayloadInfo {
+    pub fn new(image_type: PayloadImageType, reserved: u32, entry_point: u64) -> Self {
+        Self {
+            image_type: image_type as u32,
+            reserved,
+            entry_point,
+        }
+    }
+}
+
 // SAFETY: data structure only contain a series of integers
 unsafe impl ByteValued for HobHeader {}
 // SAFETY: data structure only contain a series of integers
