@@ -449,7 +449,11 @@ const SELECTION_OFFSET: u64 = 0;
 //  - Reduce the addressable space size by at least 4k to workaround a Linux
 //    bug when the VMM allocates devices at the end of the addressable space
 //  - Windows requires the addressable space size to be 64k aligned
-fn mmio_address_space_size(phys_bits: u8, tdx_enabled: bool) -> u64 {
+fn mmio_address_space_size(
+    phys_bits: u8,
+    #[cfg(feature = "tdx")] tdx_enabled: bool,
+    #[cfg(not(feature = "tdx"))] _: bool,
+) -> u64 {
     #[cfg(feature = "tdx")]
     if tdx_enabled {
         // In TDX, the guest GPA space is split at bit (phys_bits-1): addresses
@@ -461,8 +465,6 @@ fn mmio_address_space_size(phys_bits: u8, tdx_enabled: bool) -> u64 {
         let shared_bit = 1u64 << (phys_bits - 1);
         return shared_bit - (1u64 << 16);
     }
-    #[cfg(not(feature = "tdx"))]
-    let _ = tdx_enabled;
     (1u64 << phys_bits) - (1u64 << 16)
 }
 
