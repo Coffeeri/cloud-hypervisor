@@ -2845,13 +2845,14 @@ impl Vm {
                 .map_err(Error::PopulateHob)?;
         }
 
-        // MMIO regions
-        hob.add_mmio_resource(
-            &mem,
-            layout::MEM_32BIT_DEVICES_START.raw_value(),
-            layout::APIC_START.raw_value() - layout::MEM_32BIT_DEVICES_START.raw_value(),
-        )
-        .map_err(Error::PopulateHob)?;
+        // // MMIO regions
+        // hob.add_mmio_resource(
+        //     &mem,
+        //     arch::layout::MEM_32BIT_DEVICES_START.raw_value(),
+        //     arch::layout::APIC_START.raw_value()
+        //         - arch::layout::MEM_32BIT_DEVICES_START.raw_value(),
+        // )
+        // .map_err(Error::PopulateHob)?;
         // TODO: Skip the adding of the MMIO resource for the device area.
         // let start_of_device_area = self
         //     .memory_manager

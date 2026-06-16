@@ -421,23 +421,23 @@ impl TdHob {
         )
     }
 
-    pub fn add_mmio_resource(
-        &mut self,
-        mem: &GuestMemoryMmap,
-        physical_start: u64,
-        resource_length: u64,
-    ) -> Result<(), TdvfError> {
-        self.add_resource(
-            mem,
-            physical_start,
-            resource_length,
-            0x1, /* EFI_RESOURCE_MEMORY_MAPPED_IO */
-            /*
-             * EFI_RESOURCE_ATTRIBUTE_PRESENT | EFI_RESOURCE_ATTRIBUTE_INITIALIZED | EFI_RESOURCE_ATTRIBUTE_UNCACHEABLE
-             */
-            0x403,
-        )
-    }
+    // pub fn add_mmio_resource(
+    //     &mut self,
+    //     mem: &GuestMemoryMmap,
+    //     physical_start: u64,
+    //     resource_length: u64,
+    // ) -> Result<(), TdvfError> {
+    //     self.add_resource(
+    //         mem,
+    //         physical_start,
+    //         resource_length,
+    //         0x1, /* EFI_RESOURCE_MEMORY_MAPPED_IO */
+    //         /*
+    //          * EFI_RESOURCE_ATTRIBUTE_PRESENT | EFI_RESOURCE_ATTRIBUTE_INITIALIZED | EFI_RESOURCE_ATTRIBUTE_UNCACHEABLE
+    //          */
+    //         0x403,
+    //     )
+    // }
 
     pub fn add_acpi_table(
         &mut self,
