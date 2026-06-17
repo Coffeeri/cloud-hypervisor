@@ -548,7 +548,7 @@ struct KvmMemorySlot {
 
 /// Wrapper over KVM VM ioctls.
 pub struct KvmVm {
-    pub fd: Arc<VmFd>,
+    fd: Arc<VmFd>,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
     #[cfg(feature = "sev_snp")]
@@ -560,6 +560,11 @@ pub struct KvmVm {
 }
 
 impl KvmVm {
+    #[cfg(feature = "tdx")]
+    /// Fetch the KVM VM file descriptor.
+    pub fn fd(&self) -> &VmFd {
+        &self.fd
+    }
     ///
     /// Creates an emulated device in the kernel.
     ///

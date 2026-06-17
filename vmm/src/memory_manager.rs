@@ -199,6 +199,7 @@ pub(crate) struct GuestRamMapping {
     backing_page_size: u64,
 }
 
+#[cfg(feature = "tdx")]
 impl GuestRamMapping {
     pub(crate) fn slot(&self) -> u32 {
         self.slot
