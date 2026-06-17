@@ -526,6 +526,7 @@ impl Drop for CopyWorkerHandle {
 pub struct CopyWorker {
     source_io: Box<dyn AsyncIo>,
     dest_io: Box<dyn AsyncIo>,
+    dest_is_sparse: bool,
     state: Arc<MirrorState>,
     /// Once allocated, the buffer is reused for all blocks to avoid repeated allocations.
     buf: Vec<u8>,
@@ -554,6 +555,7 @@ impl CopyWorker {
         Ok(Self {
             source_io,
             dest_io,
+            dest_is_sparse: destination_disk.supports_sparse_operations(),
             state,
             buf: vec![0; block_size_bytes],
             next_user_data: 0,
@@ -629,11 +631,19 @@ impl CopyWorker {
         }
         debug_assert_eq!(user_data, read_id);
 
-        // Write buf to destination.
         let write_id = self.generate_user_data();
-        self.dest_io
-            .write_vectored(offset as off_t, &iovecs, write_id)
-            .map_err(|e| io::Error::other(format!("async io write_vectored failed: {e}")))?;
+        if self.dest_is_sparse && self.buf[..length].iter().all(|&b| b == 0) {
+            // Punch hole and preserve sparseness for zero block
+            self.dest_io
+                .punch_hole(offset, length as u64, write_id)
+                .map_err(|e| io::Error::other(format!("async io punch_hole failed: {e}")))?;
+        } else {
+            // Write buf to destination.
+            self.dest_io
+                .write_vectored(offset as off_t, &iovecs, write_id)
+                .map_err(|e| io::Error::other(format!("async io write_vectored failed: {e}")))?;
+        }
+
         let (user_data, result) = Self::wait_for_completion(&mut self.dest_io, &self.dest_waiter)?;
         if result < 0 {
             return Err(io::Error::from_raw_os_error(-result));
