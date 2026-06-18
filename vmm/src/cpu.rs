@@ -122,6 +122,30 @@ macro_rules! extract_bits_64_without_offset {
 
 pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
 
+#[cfg(feature = "tdx")]
+const TDX_GET_QUOTE_HDR_SIZE: usize = 24;
+#[cfg(feature = "tdx")]
+const GET_QUOTE_SERVICE_UNAVAILABLE: u64 = 0x8000_0000_0000_0001;
+
+#[cfg(feature = "tdx")]
+fn set_tdx_get_quote_service_unavailable(vm_ops: &dyn VmOps, gpa: u64, size: u64) -> bool {
+    if size < TDX_GET_QUOTE_HDR_SIZE as u64 {
+        return false;
+    }
+
+    let mut quote_hdr = [0u8; TDX_GET_QUOTE_HDR_SIZE];
+    if vm_ops.guest_mem_read(gpa, &mut quote_hdr).is_err() {
+        return false;
+    }
+
+    // tdx_quote_hdr.status
+    quote_hdr[8..16].copy_from_slice(&GET_QUOTE_SERVICE_UNAVAILABLE.to_le_bytes());
+    // tdx_quote_hdr.out_len
+    quote_hdr[20..24].copy_from_slice(&0u32.to_le_bytes());
+
+    vm_ops.guest_mem_write(gpa, &quote_hdr).is_ok()
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Error creating vCPU")]
@@ -1262,6 +1286,7 @@ impl CpuManager {
 
         let core_scheduling = self.config.core_scheduling;
         let core_scheduling_group_leader = self.core_scheduling_group_leader.clone();
+        let vm_ops = std::panic::AssertUnwindSafe(self.vm_ops.clone());
 
         // Retrieve seccomp filter for vcpu thread
         let vcpu_seccomp_filter = get_seccomp_filter(
@@ -1491,14 +1516,24 @@ impl CpuManager {
                                     VmExit::Tdx => {
                                             match vcpu.vcpu.get_tdx_exit_details() {
                                                 Ok(details) => match details {
-                                                    TdxExitDetails::GetQuote => warn!("TDG_VP_VMCALL_GET_QUOTE not supported"),
+                                                    TdxExitDetails::GetQuote { gpa, size } => {
+                                                        if set_tdx_get_quote_service_unavailable(&**vm_ops, gpa, size) {
+                                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::Success);
+                                                        } else {
+                                                            warn!("TDG_VP_VMCALL_GET_QUOTE malformed request");
+                                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                        }
+                                                    }
                                                     TdxExitDetails::SetupEventNotifyInterrupt => {
                                                         warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
+                                                        vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                                     }
                                                 },
-                                                Err(e) => error!("Unexpected TDX VMCALL: {e}"),
+                                                Err(e) => {
+                                                    error!("Unexpected TDX VMCALL: {e}");
+                                                    vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                }
                                             }
-                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                     }
                                 },
 

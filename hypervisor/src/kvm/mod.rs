@@ -3551,7 +3551,10 @@ impl cpu::Vcpu for KvmVcpu {
         }
 
         match tdx_vmcall.subfunction {
-            TDG_VP_VMCALL_GET_QUOTE => Ok(TdxExitDetails::GetQuote),
+            TDG_VP_VMCALL_GET_QUOTE => Ok(TdxExitDetails::GetQuote {
+                gpa: tdx_vmcall.in_r12,
+                size: tdx_vmcall.in_r13,
+            }),
             TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT => {
                 Ok(TdxExitDetails::SetupEventNotifyInterrupt)
             }
