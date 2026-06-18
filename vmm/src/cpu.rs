@@ -101,6 +101,8 @@ use crate::gdb::{Debuggable, DebuggableError, get_raw_tid};
 #[cfg(all(feature = "sev_snp", feature = "mshv"))]
 use crate::igvm::HV_PAGE_SIZE;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
+#[cfg(feature = "tdx")]
+use crate::tdx_qgs;
 #[cfg(target_arch = "x86_64")]
 use crate::vm::physical_bits;
 use crate::vm_config::{CoreScheduling, CpusConfig};
@@ -131,7 +133,7 @@ pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
 const TDX_GET_QUOTE_HDR_SIZE: usize = 24;
 #[cfg(feature = "tdx")]
 const GET_QUOTE_SERVICE_UNAVAILABLE: u64 = 0x8000_0000_0000_0001;
-#[cfg(feature = "tdx")]
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
 const TDX_EVENT_NOTIFY_MIN_VECTOR: u8 = 32;
 #[cfg(feature = "tdx")]
 const TDX_EVENT_NOTIFY_BASE_ADDR: u64 = 0xfee0_0000;
@@ -1584,20 +1586,23 @@ impl CpuManager {
                                             match vcpu.vcpu.get_tdx_exit_details() {
                                                 Ok(details) => match details {
                                                     TdxExitDetails::GetQuote { gpa, size } => {
-                                                        if set_tdx_get_quote_service_unavailable(&**vm_ops, gpa, size) {
-                                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::Success);
-                                                            #[cfg(target_arch = "x86_64")]
-                                                            if let Some(event_notify_group) =
-                                                                tdx_event_notify.lock().unwrap().as_ref().cloned()
-                                                            {
-                                                                if let Err(e) = event_notify_group.trigger(0)
-                                                                {
-                                                                    warn!("Failed to trigger TDX event-notify interrupt: {e}");
-                                                                }
+                                                        let event_group = tdx_event_notify.lock().unwrap().as_ref().cloned();
+                                                        match tdx_qgs::take_in_message(&**vm_ops, gpa, size) {
+                                                            Some(in_msg) => {
+                                                                // Mark as in-flight and resume vCPU; worker fires MSI on completion
+                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::Success);
+                                                                tdx_qgs::spawn_get_quote_worker(
+                                                                    vm_ops.0.clone(),
+                                                                    event_group,
+                                                                    gpa,
+                                                                    size,
+                                                                    in_msg,
+                                                                );
                                                             }
-                                                        } else {
-                                                            warn!("TDG_VP_VMCALL_GET_QUOTE malformed request");
-                                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                            None => {
+                                                                warn!("TDG_VP_VMCALL_GET_QUOTE malformed request");
+                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                            }
                                                         }
                                                     }
                                                     TdxExitDetails::SetupEventNotifyInterrupt { vector } => {
@@ -1605,6 +1610,9 @@ impl CpuManager {
                                                         {
                                                             if vector < TDX_EVENT_NOTIFY_MIN_VECTOR {
                                                                 warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT invalid vector {vector}");
+                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                            } else if tdx_event_notify_interrupt_manager.0.is_none() {
+                                                                warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT: MSI manager not yet available");
                                                                 vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                                             } else if let Some(manager) =
                                                                 tdx_event_notify_interrupt_manager.0.as_ref()
@@ -1636,7 +1644,7 @@ impl CpuManager {
                                                                     0,
                                                                     InterruptSourceConfig::MsiIrq(config),
                                                                     false,
-                                                                    true,
+                                                                    false,
                                                                 ) {
                                                                     warn!("Failed updating TDX event-notify interrupt route: {e}");
                                                                     vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
