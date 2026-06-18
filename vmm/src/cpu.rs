@@ -70,6 +70,11 @@ use seccompiler::{SeccompAction, apply_filter};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::BusDevice;
+#[cfg(feature = "tdx")]
+use vm_device::interrupt::{
+    InterruptManager, InterruptSourceConfig, InterruptSourceGroup, MsiIrqGroupConfig,
+    MsiIrqSourceConfig,
+};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use vm_memory::ByteValued;
 #[cfg(feature = "guest_debug")]
@@ -126,6 +131,10 @@ pub const CPU_MANAGER_ACPI_SIZE: usize = 0xc;
 const TDX_GET_QUOTE_HDR_SIZE: usize = 24;
 #[cfg(feature = "tdx")]
 const GET_QUOTE_SERVICE_UNAVAILABLE: u64 = 0x8000_0000_0000_0001;
+#[cfg(feature = "tdx")]
+const TDX_EVENT_NOTIFY_MIN_VECTOR: u8 = 32;
+#[cfg(feature = "tdx")]
+const TDX_EVENT_NOTIFY_BASE_ADDR: u64 = 0xfee0_0000;
 
 #[cfg(feature = "tdx")]
 fn set_tdx_get_quote_service_unavailable(vm_ops: &dyn VmOps, gpa: u64, size: u64) -> bool {
@@ -144,6 +153,20 @@ fn set_tdx_get_quote_service_unavailable(vm_ops: &dyn VmOps, gpa: u64, size: u64
     quote_hdr[20..24].copy_from_slice(&0u32.to_le_bytes());
 
     vm_ops.guest_mem_write(gpa, &quote_hdr).is_ok()
+}
+
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+fn build_tdx_event_notify_msi_config(apic_id: u32, vector: u8) -> MsiIrqSourceConfig {
+    let address = TDX_EVENT_NOTIFY_BASE_ADDR
+        | ((u64::from(apic_id) & 0xff) << 12)
+        | ((u64::from(apic_id) & 0xffffff00) << 32);
+
+    MsiIrqSourceConfig {
+        high_addr: (address >> 32) as u32,
+        low_addr: address as u32,
+        data: u32::from(vector),
+        devid: 0,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -774,6 +797,9 @@ pub struct CpuManager {
     vcpus: Vec<Arc<Mutex<Vcpu>>>,
     seccomp_action: SeccompAction,
     vm_ops: Arc<dyn VmOps>,
+    #[cfg(feature = "tdx")]
+    tdx_event_notify_interrupt_manager:
+        Option<Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>>,
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     acpi_address: Option<GuestAddress>,
     proximity_domain_per_cpu: BTreeMap<u32, u32>,
@@ -820,8 +846,6 @@ impl TryFrom<i32> for CoreSchedulingLeader {
     }
 }
 
-/// Management structure for a vCPU (thread).
-#[derive(Default)]
 struct VcpuState {
     inserting: bool,
     removing: bool,
@@ -834,6 +858,39 @@ struct VcpuState {
     vcpu_run_interrupted: Arc<AtomicBool>,
     /// Used to ACK state changes from the run vCPU loop to the CPU Manager.
     paused: Arc<AtomicBool>,
+    #[cfg(feature = "tdx")]
+    tdx_event_notify: Arc<Mutex<Option<Arc<dyn InterruptSourceGroup>>>>,
+}
+
+#[cfg(feature = "tdx")]
+impl Default for VcpuState {
+    fn default() -> Self {
+        Self {
+            inserting: false,
+            removing: false,
+            pending_removal: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            kill: Arc::new(AtomicBool::new(false)),
+            vcpu_run_interrupted: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            tdx_event_notify: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+#[cfg(not(feature = "tdx"))]
+impl Default for VcpuState {
+    fn default() -> Self {
+        Self {
+            inserting: false,
+            removing: false,
+            pending_removal: Arc::new(AtomicBool::new(false)),
+            handle: None,
+            kill: Arc::new(AtomicBool::new(false)),
+            vcpu_run_interrupted: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 impl VcpuState {
@@ -1014,6 +1071,8 @@ impl CpuManager {
             vcpus: Vec::with_capacity(max_vcpus),
             seccomp_action,
             vm_ops,
+            #[cfg(feature = "tdx")]
+            tdx_event_notify_interrupt_manager: None,
             acpi_address: None,
             proximity_domain_per_cpu,
             affinity,
@@ -1287,6 +1346,15 @@ impl CpuManager {
         let core_scheduling = self.config.core_scheduling;
         let core_scheduling_group_leader = self.core_scheduling_group_leader.clone();
         let vm_ops = std::panic::AssertUnwindSafe(self.vm_ops.clone());
+        #[cfg(feature = "tdx")]
+        let tdx_event_notify_interrupt_manager =
+            std::panic::AssertUnwindSafe(self.tdx_event_notify_interrupt_manager.clone());
+        #[cfg(feature = "tdx")]
+        let tdx_event_notify = self.vcpu_states.lock().unwrap()[usize::try_from(vcpu_id).unwrap()]
+            .tdx_event_notify
+            .clone();
+        #[cfg(target_arch = "x86_64")]
+        let vcpu_topology = self.get_vcpu_topology();
 
         // Retrieve seccomp filter for vcpu thread
         let vcpu_seccomp_filter = get_seccomp_filter(
@@ -1403,7 +1471,7 @@ impl CpuManager {
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
 
-                    panic::catch_unwind(move || {
+                    panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                         loop {
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
@@ -1477,7 +1545,6 @@ impl CpuManager {
                             // vcpu.run() returns false on a triple-fault so trigger a reset
                             match vcpu.run() {
                                 Ok(run) => match run {
-                                    #[cfg(feature = "kvm")]
                                     VmExit::Debug => {
                                         info!("VmExit::Debug");
                                         #[cfg(feature = "guest_debug")]
@@ -1519,14 +1586,84 @@ impl CpuManager {
                                                     TdxExitDetails::GetQuote { gpa, size } => {
                                                         if set_tdx_get_quote_service_unavailable(&**vm_ops, gpa, size) {
                                                             vcpu.vcpu.set_tdx_status(TdxExitStatus::Success);
+                                                            #[cfg(target_arch = "x86_64")]
+                                                            if let Some(event_notify_group) =
+                                                                tdx_event_notify.lock().unwrap().as_ref().cloned()
+                                                            {
+                                                                if let Err(e) = event_notify_group.trigger(0)
+                                                                {
+                                                                    warn!("Failed to trigger TDX event-notify interrupt: {e}");
+                                                                }
+                                                            }
                                                         } else {
                                                             warn!("TDG_VP_VMCALL_GET_QUOTE malformed request");
                                                             vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
                                                         }
                                                     }
-                                                    TdxExitDetails::SetupEventNotifyInterrupt => {
-                                                        warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT not supported");
-                                                        vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                    TdxExitDetails::SetupEventNotifyInterrupt { vector } => {
+                                                        #[cfg(target_arch = "x86_64")]
+                                                        {
+                                                            if vector < TDX_EVENT_NOTIFY_MIN_VECTOR {
+                                                                warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT invalid vector {vector}");
+                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                            } else if let Some(manager) =
+                                                                tdx_event_notify_interrupt_manager.0.as_ref()
+                                                            {
+                                                                let apic_id =
+                                                                    arch::x86_64::get_x2apic_id(vcpu_id, vcpu_topology);
+                                                                let mut state = tdx_event_notify.lock().unwrap();
+                                                                let event_notify_group = if let Some(group) = state.as_ref() {
+                                                                    Arc::clone(group)
+                                                                } else {
+                                                                    match manager.create_group(MsiIrqGroupConfig {
+                                                                        base: 0,
+                                                                        count: 1,
+                                                                    }) {
+                                                                        Ok(group) => {
+                                                                            *state = Some(Arc::clone(&group));
+                                                                            group
+                                                                        }
+                                                                        Err(e) => {
+                                                                            warn!("Failed creating TDX event-notify interrupt group: {e}");
+                                                                            vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                                            return;
+                                                                        }
+                                                                    }
+                                                                };
+
+                                                                let config = build_tdx_event_notify_msi_config(apic_id, vector);
+                                                                if let Err(e) = event_notify_group.update(
+                                                                    0,
+                                                                    InterruptSourceConfig::MsiIrq(config),
+                                                                    false,
+                                                                    true,
+                                                                ) {
+                                                                    warn!("Failed updating TDX event-notify interrupt route: {e}");
+                                                                    vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                                    return;
+                                                                }
+
+                                                                if let Err(e) = event_notify_group.set_gsi() {
+                                                                    warn!("Failed setting TDX event-notify GSI routing: {e}");
+                                                                    vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                                    return;
+                                                                }
+
+                                                                if let Err(e) = event_notify_group.enable() {
+                                                                    warn!("Failed enabling TDX event-notify interrupt route: {e}");
+                                                                    vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                                    return;
+                                                                }
+
+                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::Success);
+                                                            }
+                                                            #[cfg(not(target_arch = "x86_64"))]
+                                                            {
+                                                                let _ = vector;
+                                                                warn!("TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT is unsupported on this architecture");
+                                                                vcpu.vcpu.set_tdx_status(TdxExitStatus::InvalidOperand);
+                                                            }
+                                                        }
                                                     }
                                                 },
                                                 Err(e) => {
@@ -1553,7 +1690,7 @@ impl CpuManager {
                                 break;
                             }
                         }
-                    })
+                    }))
                     .or_else(|_| {
                         panic_vcpu_run_interrupted.store(true, Ordering::SeqCst);
                         error!("vCPU thread panicked");
@@ -2417,6 +2554,14 @@ impl CpuManager {
         interrupt_controller: Arc<Mutex<dyn InterruptController>>,
     ) {
         self.interrupt_controller = Some(interrupt_controller);
+    }
+
+    #[cfg(feature = "tdx")]
+    pub(crate) fn set_tdx_event_notify_interrupt_manager(
+        &mut self,
+        interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
+    ) {
+        self.tdx_event_notify_interrupt_manager = Some(interrupt_manager);
     }
 
     pub(crate) fn vcpus_kill_signalled(&self) -> &Arc<AtomicBool> {

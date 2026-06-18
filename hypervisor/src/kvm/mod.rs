@@ -2609,7 +2609,7 @@ impl cpu::Vcpu for KvmVcpu {
                     Ok(cpu::VmExit::Ignore)
                 }
                 VcpuExit::Hyperv => Ok(cpu::VmExit::Hyperv),
-                #[cfg(feature = "tdx")]
+                #[cfg(all(feature = "tdx", not(feature = "sev_snp")))]
                 VcpuExit::Hypercall(exit) => {
                     if exit.nr == 12 {
                         // KVM_HC_MAP_GPA_RANGE
@@ -2629,7 +2629,7 @@ impl cpu::Vcpu for KvmVcpu {
                 #[cfg(feature = "tdx")]
                 VcpuExit::Unsupported(KVM_EXIT_TDX) => Ok(cpu::VmExit::Tdx),
                 VcpuExit::Debug(_) => Ok(cpu::VmExit::Debug),
-                #[cfg(feature = "sev_snp")]
+                #[cfg(all(feature = "sev_snp", not(feature = "tdx")))]
                 VcpuExit::Hypercall(hypercall) => {
                     // https://docs.kernel.org/virt/kvm/x86/hypercalls.html#kvm-hc-map-gpa-range
                     const KVM_HC_MAP_GPA_RANGE: u64 = 12;
@@ -3556,7 +3556,9 @@ impl cpu::Vcpu for KvmVcpu {
                 size: tdx_vmcall.in_r13,
             }),
             TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT => {
-                Ok(TdxExitDetails::SetupEventNotifyInterrupt)
+                Ok(TdxExitDetails::SetupEventNotifyInterrupt {
+                    vector: tdx_vmcall.in_r12 as u8,
+                })
             }
             _ => Err(cpu::HypervisorCpuError::UnknownTdxVmCall),
         }

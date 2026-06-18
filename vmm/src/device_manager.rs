@@ -1512,6 +1512,12 @@ impl DeviceManager {
             .unwrap()
             .set_interrupt_controller(interrupt_controller.clone());
 
+        #[cfg(feature = "tdx")]
+        self.cpu_manager
+            .lock()
+            .unwrap()
+            .set_tdx_event_notify_interrupt_manager(self.msi_interrupt_manager.clone());
+
         // Now we can create the legacy interrupt manager, which needs the freshly
         // formed IOAPIC device.
         let legacy_interrupt_manager: Arc<
