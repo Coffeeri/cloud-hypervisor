@@ -760,4 +760,278 @@ mod tests {
         locked.insert(10u64, 20u64);
         assert!(!RangeLockManager::overlaps_any(&locked, 20, 30));
     }
+
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// In-memory [`AsyncIo`] backend for driving [`MirroringAsyncIo`] in a unit
+    /// test without a real fd, io_uring, or the copy worker. Each submission is
+    /// recorded as an immediately-available completion and the notifier eventfd
+    /// is signaled, so a synchronous wait loop on the notifier observes it.
+    struct MockAsyncIo {
+        evt: EventFd,
+        completions: VecDeque<(u64, i32)>,
+        /// When set, the next `write_vectored` submit returns an error instead
+        /// of completing - used to drive the destination-failure degrade path.
+        fail_next_write: bool,
+    }
+
+    impl MockAsyncIo {
+        fn new() -> Self {
+            Self {
+                evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                completions: VecDeque::new(),
+                fail_next_write: false,
+            }
+        }
+
+        /// Record a completion and wake any waiter parked on the notifier.
+        fn complete(&mut self, user_data: u64, result: i32) {
+            self.completions.push_back((user_data, result));
+            self.evt.write(1).unwrap();
+        }
+    }
+
+    impl AsyncIo for MockAsyncIo {
+        fn notifier(&self) -> &EventFd {
+            &self.evt
+        }
+        fn read_vectored(&mut self, _o: off_t, _i: &[iovec], ud: u64) -> AsyncIoResult<()> {
+            self.complete(ud, 0);
+            Ok(())
+        }
+        fn write_vectored(&mut self, _o: off_t, _i: &[iovec], ud: u64) -> AsyncIoResult<()> {
+            if self.fail_next_write {
+                self.fail_next_write = false;
+                return Err(AsyncIoError::WriteVectored(io::Error::other("injected")));
+            }
+            self.complete(ud, 0);
+            Ok(())
+        }
+        fn fsync(&mut self, ud: Option<u64>) -> AsyncIoResult<()> {
+            if let Some(ud) = ud {
+                self.complete(ud, 0);
+            }
+            Ok(())
+        }
+        fn punch_hole(&mut self, _o: u64, _l: u64, ud: u64) -> AsyncIoResult<()> {
+            self.complete(ud, 0);
+            Ok(())
+        }
+        fn write_zeroes(&mut self, _o: u64, _l: u64, ud: u64) -> AsyncIoResult<()> {
+            self.complete(ud, 0);
+            Ok(())
+        }
+        fn next_completed_request(&mut self) -> Option<(u64, i32)> {
+            self.completions.pop_front()
+        }
+    }
+
+    /// Builds a [`MirroringAsyncIo`] over two fresh mock backends sharing a new
+    /// [`MirrorState`].
+    fn mirror_with_mocks() -> MirroringAsyncIo {
+        mirror_from(
+            MockAsyncIo::new(),
+            MockAsyncIo::new(),
+            MirrorState::new(1 << 20),
+        )
+    }
+
+    /// Builds a [`MirroringAsyncIo`] over the given mock backends, constructing
+    /// the per-backend waiters from their notifiers. The one place to update
+    /// when the struct fields change.
+    fn mirror_from<S: AsyncIo + 'static, D: AsyncIo + 'static>(
+        source: S,
+        destination: D,
+        state: Arc<MirrorState>,
+    ) -> MirroringAsyncIo {
+        let source_waiter = EpollWaiter::new(source.notifier().as_raw_fd()).unwrap();
+        let dest_waiter = EpollWaiter::new(destination.notifier().as_raw_fd()).unwrap();
+        MirroringAsyncIo {
+            source: Box::new(source),
+            destination: Box::new(destination),
+            state,
+            inflight_completions: VecDeque::new(),
+            source_passthrough: false,
+            source_waiter,
+            dest_waiter,
+        }
+    }
+
+    /// Single 4 KiB iovec backed by `buf`. The mocks never touch the buffer, so
+    /// it only needs to outlive the submit call.
+    fn iov_of(buf: &[u8]) -> [iovec; 1] {
+        [iovec {
+            iov_base: buf.as_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        }]
+    }
+
+    /// Runs `f` on a worker thread and fails the test if it does not finish
+    /// within `timeout`. Turns a submit-path deadlock into a clean failure
+    /// instead of a hung suite: the worker stays blocked, but the test thread
+    /// resumes after the timeout and panics.
+    fn run_with_watchdog(timeout: Duration, f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            f();
+            let _ = tx.send(());
+        });
+        if rx.recv_timeout(timeout).is_err() {
+            panic!("scenario did not finish within {timeout:?} - deadlock");
+        }
+    }
+
+    /// Drains completions until `n` have arrived (or the budget is exhausted).
+    fn drain_n(mirror: &mut MirroringAsyncIo, n: usize) -> Vec<u64> {
+        let mut acked = Vec::new();
+        for _ in 0..64 {
+            while let Some((user_data, result)) = mirror.next_completed_request() {
+                assert_eq!(result, 0, "unexpected error completion");
+                acked.push(user_data);
+            }
+            if acked.len() >= n {
+                break;
+            }
+        }
+        acked
+    }
+
+    /// Core regression: two overlapping guest writes submitted before either is
+    /// reaped must both complete, in order, without deadlocking the reactor.
+    ///
+    /// RED on the blocking-`lock_range` submit path (the second write blocks in
+    /// `lock_iovecs` waiting for the first's guard, which only the same - now
+    /// blocked - thread could release), caught by the watchdog. GREEN once
+    /// writes are synchronous so only one is ever in flight.
+    #[test]
+    fn overlapping_writes_complete_in_order() {
+        run_with_watchdog(Duration::from_secs(5), || {
+            let mut mirror = mirror_with_mocks();
+            let buf = [0u8; 4096];
+            let iov = iov_of(&buf);
+
+            mirror.write_vectored(0, &iov, 1).unwrap();
+            mirror.write_vectored(0, &iov, 2).unwrap();
+
+            assert_eq!(
+                drain_n(&mut mirror, 2),
+                vec![1, 2],
+                "both overlapping writes complete in submission order"
+            );
+        });
+    }
+
+    /// Same deadlock path via `punch_hole` (ranged, takes the same lock).
+    #[test]
+    fn overlapping_punch_holes_complete() {
+        run_with_watchdog(Duration::from_secs(5), || {
+            let mut mirror = mirror_with_mocks();
+            mirror.punch_hole(0, 4096, 1).unwrap();
+            mirror.punch_hole(0, 4096, 2).unwrap();
+            assert_eq!(drain_n(&mut mirror, 2), vec![1, 2]);
+        });
+    }
+
+    /// Non-overlapping writes never contend, so both proceed and complete.
+    #[test]
+    fn non_overlapping_writes_both_complete() {
+        run_with_watchdog(Duration::from_secs(5), || {
+            let mut mirror = mirror_with_mocks();
+            let buf = [0u8; 4096];
+            let iov = iov_of(&buf);
+
+            mirror.write_vectored(0, &iov, 1).unwrap();
+            mirror.write_vectored(8192, &iov, 2).unwrap();
+
+            let mut acked = drain_n(&mut mirror, 2);
+            acked.sort();
+            assert_eq!(acked, vec![1, 2]);
+        });
+    }
+
+    /// Guards the copy-worker-vs-guest invariant: while the copy worker holds a
+    /// range (here simulated by holding a `RangeGuard` on the shared lock
+    /// manager), an overlapping guest write must not proceed; it proceeds only
+    /// once the range is released. Green before and after the fix - the range
+    /// lock still serializes this cross-thread conflict.
+    #[test]
+    fn copy_worker_hold_serializes_overlapping_guest_write() {
+        let state = MirrorState::new(1 << 20);
+        // The "copy worker" holds [0, 4096).
+        let guard = state.range_locks.lock_range(0, 4096).unwrap();
+
+        let mut mirror = mirror_from(MockAsyncIo::new(), MockAsyncIo::new(), state.clone());
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let buf = [0u8; 4096];
+            let iov = iov_of(&buf);
+            mirror.write_vectored(0, &iov, 1).unwrap();
+            tx.send(()).unwrap();
+        });
+
+        // The held range must block the overlapping guest write.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "guest write proceeded while the copy worker held the range"
+        );
+
+        // Releasing the range lets the write through.
+        drop(guard);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "guest write did not proceed after the range was released"
+        );
+        handle.join().unwrap();
+    }
+
+    /// Reads are source-only passthrough (no range lock) and still complete.
+    #[test]
+    fn read_passes_through_to_source() {
+        run_with_watchdog(Duration::from_secs(5), || {
+            let mut mirror = mirror_with_mocks();
+            let buf = [0u8; 4096];
+            let iov = iov_of(&buf);
+
+            mirror.read_vectored(0, &iov, 7).unwrap();
+
+            let mut got = None;
+            for _ in 0..64 {
+                if let Some(c) = mirror.next_completed_request() {
+                    got = Some(c);
+                    break;
+                }
+            }
+            assert_eq!(got, Some((7, 0)), "read completes via the source");
+        });
+    }
+
+    /// A destination submit failure degrades the mirror to source passthrough:
+    /// the phase goes `Failed`, and both the failing write and a subsequent
+    /// write still complete to the guest off the source alone.
+    #[test]
+    fn destination_submit_failure_degrades_to_passthrough() {
+        run_with_watchdog(Duration::from_secs(5), || {
+            let mut dest = MockAsyncIo::new();
+            dest.fail_next_write = true;
+            let mut mirror = mirror_from(MockAsyncIo::new(), dest, MirrorState::new(1 << 20));
+            let buf = [0u8; 4096];
+            let iov = iov_of(&buf);
+
+            mirror.write_vectored(0, &iov, 1).unwrap();
+            assert!(
+                matches!(mirror.state.phase(), MirrorPhase::Failed(_)),
+                "destination failure transitions the mirror to Failed"
+            );
+
+            // Subsequent write goes to the source only.
+            mirror.write_vectored(0, &iov, 2).unwrap();
+
+            let mut acked = drain_n(&mut mirror, 2);
+            acked.sort();
+            assert_eq!(acked, vec![1, 2], "both writes complete off the source");
+        });
+    }
 }
