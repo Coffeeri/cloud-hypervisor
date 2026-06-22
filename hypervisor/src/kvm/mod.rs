@@ -24,8 +24,6 @@ use std::os::raw;
 #[cfg(any(feature = "sev_snp", feature = "tdx"))]
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
-#[cfg(feature = "tdx")]
-use std::ptr;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::sync::Mutex;
 #[cfg(feature = "sev_snp")]
@@ -33,6 +31,8 @@ use std::sync::OnceLock;
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+#[cfg(feature = "tdx")]
+use std::time::{Duration, Instant};
 #[cfg(target_arch = "aarch64")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io, result};
@@ -1566,25 +1566,39 @@ fn tdx_command(
     flags: u32,
     data: *const libc::c_void,
 ) -> io::Result<()> {
+    const TDX_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
     let cmd = KvmTdxCmd {
         id: command,
         flags,
         data: data as _,
         hw_error: 0,
     };
-    // SAFETY: FFI call. All input parameters are valid.
-    let ret = unsafe {
-        ioctl_with_val(
-            &fd,
-            KVM_MEMORY_ENCRYPT_OP(),
-            &cmd as *const KvmTdxCmd as std::os::raw::c_ulong,
-        )
-    };
+    let start = Instant::now();
+    loop {
+        // SAFETY: FFI call. All input parameters are valid.
+        let ret = unsafe {
+            ioctl_with_val(
+                &fd,
+                KVM_MEMORY_ENCRYPT_OP(),
+                &cmd as *const KvmTdxCmd as std::os::raw::c_ulong,
+            )
+        };
+        if ret >= 0 {
+            return Ok(());
+        }
 
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            if start.elapsed() >= TDX_COMMAND_TIMEOUT {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "KVM TDX command timed out after repeated EINTR",
+                ));
+            }
+            continue;
+        }
+        return Err(e);
     }
-    Ok(())
 }
 
 #[cfg(feature = "tdx")]
