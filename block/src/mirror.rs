@@ -1034,4 +1034,143 @@ mod tests {
             assert_eq!(acked, vec![1, 2], "both writes complete off the source");
         });
     }
+
+    /// Mock backend whose completions are withheld until [`Gate::release`], so a
+    /// test can hold a write parked in `wait_for_completions`.
+    struct GatedMockAsyncIo {
+        evt: EventFd,
+        inner: Arc<Mutex<GatedInner>>,
+        /// Notified on each submit, so a test can wait until the in-flight write
+        /// has reached this backend (and so already holds its range guard).
+        on_submit: mpsc::Sender<()>,
+    }
+
+    struct GatedInner {
+        /// Submitted, not yet released.
+        pending: VecDeque<(u64, i32)>,
+        /// Released, deliverable via `next_completed_request`.
+        ready: VecDeque<(u64, i32)>,
+    }
+
+    /// Releases a [`GatedMockAsyncIo`]'s withheld completions from another thread.
+    struct Gate {
+        evt: EventFd,
+        inner: Arc<Mutex<GatedInner>>,
+    }
+
+    impl Gate {
+        fn release(&self) {
+            let mut inner = self.inner.lock().unwrap();
+            while let Some(completion) = inner.pending.pop_front() {
+                inner.ready.push_back(completion);
+            }
+            self.evt.write(1).unwrap();
+        }
+    }
+
+    impl GatedMockAsyncIo {
+        fn new(on_submit: mpsc::Sender<()>) -> Self {
+            Self {
+                evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                inner: Arc::new(Mutex::new(GatedInner {
+                    pending: VecDeque::new(),
+                    ready: VecDeque::new(),
+                })),
+                on_submit,
+            }
+        }
+
+        fn gate(&self) -> Gate {
+            Gate {
+                evt: self.evt.try_clone().unwrap(),
+                inner: Arc::clone(&self.inner),
+            }
+        }
+
+        fn submit(&self, user_data: u64) {
+            self.inner.lock().unwrap().pending.push_back((user_data, 0));
+            let _ = self.on_submit.send(());
+        }
+    }
+
+    impl AsyncIo for GatedMockAsyncIo {
+        fn notifier(&self) -> &EventFd {
+            &self.evt
+        }
+        fn read_vectored(&mut self, _o: off_t, _i: &[iovec], ud: u64) -> AsyncIoResult<()> {
+            self.submit(ud);
+            Ok(())
+        }
+        fn write_vectored(&mut self, _o: off_t, _i: &[iovec], ud: u64) -> AsyncIoResult<()> {
+            self.submit(ud);
+            Ok(())
+        }
+        fn fsync(&mut self, ud: Option<u64>) -> AsyncIoResult<()> {
+            if let Some(ud) = ud {
+                self.submit(ud);
+            }
+            Ok(())
+        }
+        fn punch_hole(&mut self, _o: u64, _l: u64, ud: u64) -> AsyncIoResult<()> {
+            self.submit(ud);
+            Ok(())
+        }
+        fn write_zeroes(&mut self, _o: u64, _l: u64, ud: u64) -> AsyncIoResult<()> {
+            self.submit(ud);
+            Ok(())
+        }
+        fn next_completed_request(&mut self) -> Option<(u64, i32)> {
+            self.inner.lock().unwrap().ready.pop_front()
+        }
+    }
+
+    /// The range guard must stay held across the whole synchronous submit+wait,
+    /// not only during acquisition. With the destination completion withheld the
+    /// write parks in `wait_for_completions`; while it is parked an overlapping
+    /// `lock_range` must block, and acquire only once the write finishes and
+    /// drops its guard. This pins the `let _guard` lifetime: a regression to
+    /// `let _ =` (guard dropped immediately) lets the overlapping lock acquire
+    /// while the write is still in flight, failing the first assertion.
+    #[test]
+    fn guard_is_held_across_submit_and_wait() {
+        let state = MirrorState::new(1 << 20);
+
+        // Source completes immediately; destination is gated, so the write parks
+        // waiting on the destination completion while holding the range lock.
+        let (submitted_tx, submitted_rx) = mpsc::channel();
+        let dest = GatedMockAsyncIo::new(submitted_tx);
+        let gate = dest.gate();
+        let mut mirror = mirror_from(MockAsyncIo::new(), dest, state.clone());
+
+        let writer = thread::spawn(move || {
+            let buf = [0u8; 4096];
+            let iov = iov_of(&buf);
+            mirror.write_vectored(0, &iov, 1).unwrap();
+        });
+
+        // The write reached the destination submit, so its range guard is held.
+        submitted_rx.recv().unwrap();
+
+        // An overlapping lock_range must block while the in-flight write holds it.
+        let locker_state = state.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let locker = thread::spawn(move || {
+            let _g = locker_state.range_locks.lock_range(0, 4096).unwrap();
+            locked_tx.send(()).unwrap();
+        });
+        assert!(
+            locked_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "lock_range acquired while the in-flight write still held the range"
+        );
+
+        // Releasing the destination completion lets the write finish and drop its
+        // guard, which unblocks the overlapping lock_range.
+        gate.release();
+        writer.join().unwrap();
+        assert!(
+            locked_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "lock_range did not acquire after the write released the range"
+        );
+        locker.join().unwrap();
+    }
 }
