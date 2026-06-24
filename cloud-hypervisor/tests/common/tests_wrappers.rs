@@ -1674,7 +1674,15 @@ pub(crate) fn _test_simple_launch(guest: &Guest) {
 
 pub(crate) fn _test_multi_cpu(guest: &Guest) {
     let mut cmd = GuestCommand::new(guest);
-    cmd.args(["--cpus", "boot=2,max=4"])
+    let cpu_info = format!(
+        "boot=2,{}",
+        if guest.vm_type == GuestVmType::Tdx {
+            "max_phys_bits=52"
+        } else {
+            "max=4"
+        },
+    );
+    cmd.args(["--cpus", cpu_info.as_str()])
         .default_memory()
         .default_kernel_cmdline()
         .capture_output()

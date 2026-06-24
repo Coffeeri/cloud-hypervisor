@@ -444,6 +444,7 @@ cmd_tests() {
         "--integration-windows") { integration_windows=true; } ;;
         "--integration-rate-limiter") { integration_rate_limiter=true; } ;;
         "--integration-cvm") { integration_cvm=true; } ;;
+        "--integration-tdx") { integration_tdx=true; } ;;
         "--metrics") { metrics=true; } ;;
         "--coverage") { coverage=true; } ;;
         "--libc")
@@ -613,6 +614,33 @@ cmd_tests() {
             --env LLVM_PROFILE_FILE="$LLVM_PROFILE_FILE" \
             "$CTR_IMAGE" \
             ./scripts/run_integration_tests_cvm.sh "$@" || fix_dir_perms $? || exit $?
+    fi
+
+    if [ "$integration_tdx" = true ]; then
+        say "Running TDX integration tests for $target..."
+        $DOCKER_RUNTIME run \
+            --workdir "$CTR_CLH_ROOT_DIR" \
+            --rm \
+            --privileged \
+            --security-opt seccomp=unconfined \
+            --ipc=host \
+            --net="$CTR_CLH_NET" \
+            --mount type=tmpfs,destination=/tmp \
+            --volume /dev:/dev \
+            --volume "$CLH_ROOT_DIR:$CTR_CLH_ROOT_DIR" \
+            ${exported_volumes:+"$exported_volumes"} \
+            --volume "$CLH_INTEGRATION_WORKLOADS:$CTR_CLH_INTEGRATION_WORKLOADS" \
+            --env USER="root" \
+            --env BUILD_TARGET="$target" \
+            --env RUSTFLAGS="$rustflags" \
+            --env TARGET_CC="$target_cc" \
+            --env AUTH_DOWNLOAD_TOKEN="$AUTH_DOWNLOAD_TOKEN" \
+            --env LLVM_PROFILE_FILE="$LLVM_PROFILE_FILE" \
+            --env http_proxy="$http_proxy" \
+            --env https_proxy="$https_proxy" \
+            --env no_proxy="$no_proxy" \
+            "$CTR_IMAGE" \
+            ./scripts/run_integration_tests_tdx.sh "$@" || fix_dir_perms $? || exit $?
     fi
 
     if [ "$integration_vfio" = true ]; then
