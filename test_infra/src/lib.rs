@@ -2182,7 +2182,12 @@ impl<'a> GuestCommand<'a> {
                 ),
             ]);
         } else if self.guest.vm_type == GuestVmType::Tdx {
-            self.command.args(["--platform", "tdx=on"]);
+            let tdx_platform = if let Some(p) = platform {
+                format!("tdx=on,{p}")
+            } else {
+                "tdx=on".to_string()
+            };
+            self.command.args(["--platform", tdx_platform.as_str()]);
             if let Some(kernel) = &self.guest.kernel_path {
                 self.command.args(["--firmware", kernel.as_str()]);
             }

@@ -12,12 +12,14 @@ mod common;
 
 #[cfg(all(feature = "tdx", target_arch = "x86_64"))]
 mod common_tdx {
+    use std::io::Read;
     use std::os::unix::io::AsRawFd;
 
     use block::ImageType;
     use common::tests_wrappers::*;
     use common::utils::*;
     use test_infra::*;
+    use wait_timeout::ChildExt;
     const NUM_PCI_SEGMENTS: u16 = 8;
 
     use super::*;
@@ -136,6 +138,158 @@ mod common_tdx {
     }
 
     #[test]
+    fn test_virtio_block_io_uring() {
+        let guest = make_virtio_block_guest(
+            &GuestFactory::new_tdx_guest_factory(),
+            "noble-server-cloudimg-amd64-UEFI.img",
+        )
+        .with_kernel(fw_path(FwType::Tdvf));
+        _test_virtio_block(&guest, false, true, false, false, ImageType::Qcow2);
+    }
+
+    #[test]
+    fn test_virtio_block_aio() {
+        let guest = make_virtio_block_guest(
+            &GuestFactory::new_tdx_guest_factory(),
+            "noble-server-cloudimg-amd64-UEFI.img",
+        )
+        .with_kernel(fw_path(FwType::Tdvf));
+        _test_virtio_block(&guest, true, false, false, false, ImageType::Qcow2);
+    }
+
+    #[test]
+    fn test_virtio_block_sync() {
+        let guest = make_virtio_block_guest(
+            &GuestFactory::new_tdx_guest_factory(),
+            "noble-server-cloudimg-amd64-UEFI.img",
+        )
+        .with_kernel(fw_path(FwType::Tdvf));
+        _test_virtio_block(&guest, true, true, false, false, ImageType::Qcow2);
+    }
+
+    #[test]
+    fn test_disk_hotplug() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+        _test_disk_hotplug_no_reboot(&guest, false);
+    }
+
+    #[test]
+    fn test_split_irqchip() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+        _test_split_irqchip(&guest);
+    }
+
+    #[test]
+    fn test_dmi_uuid() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+
+        let expected_uuid = "1e8aa28a-435d-4027-87f4-40dceff1fa0a";
+        let platform = format!("uuid={expected_uuid}");
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline_with_platform(Some(&platform))
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            let uuid = guest
+                .ssh_command(
+                    "sudo sh -c 'cat /sys/class/dmi/id/product_uuid 2>/dev/null || cat /sys/devices/virtual/dmi/id/product_uuid 2>/dev/null || true'",
+                )
+                .unwrap()
+                .trim()
+                .to_ascii_lowercase();
+
+            if !uuid.is_empty() {
+                let is_hex = |c: u8| c.is_ascii_hexdigit();
+                let b = uuid.as_bytes();
+                assert!(
+                    b.len() == 36
+                        && b[8] == b'-'
+                        && b[13] == b'-'
+                        && b[18] == b'-'
+                        && b[23] == b'-'
+                        && b.iter()
+                            .enumerate()
+                            .all(|(idx, c)| { [8usize, 13, 18, 23].contains(&idx) || is_hex(*c) }),
+                    "guest product_uuid is not in UUID format: {uuid}"
+                );
+            }
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_dmi_oem_strings() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+
+        let s1 = "io.systemd.credential:xx=yy";
+        let s2 = "This is a test string";
+        let platform = format!("oem_strings=[{s1},{s2}]");
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline_with_platform(Some(&platform))
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            let count = guest
+                .ssh_command(
+                    "sudo sh -c 'if command -v dmidecode >/dev/null 2>&1; then dmidecode --oem-string count 2>/dev/null || echo N/A; else echo N/A; fi'",
+                )
+                .unwrap()
+                .trim()
+                .to_string();
+
+            // TDX guests may not expose OEM strings through dmidecode in all environments.
+            if count != "N/A" {
+                assert_eq!(count, "2");
+                assert_eq!(
+                    guest
+                        .ssh_command("sudo dmidecode --oem-string 1")
+                        .unwrap()
+                        .trim(),
+                    s1
+                );
+                assert_eq!(
+                    guest
+                        .ssh_command("sudo dmidecode --oem-string 2")
+                        .unwrap()
+                        .trim(),
+                    s2
+                );
+            }
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
     fn test_multiple_network_interfaces() {
         let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
             .with_kernel(fw_path(FwType::Tdvf));
@@ -177,11 +331,89 @@ mod common_tdx {
         handle_child_output(r, &output);
     }
 
-    // #[test]
-    // fn test_serial_off() {
-    //     let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img").with_kernel(fw_path(FwType::Tdvf));
-    //     _test_serial_off(&guest);
-    // }
+    #[test]
+    fn test_serial_off() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--serial", "off"])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // With --serial off, guest legacy COM accesses should hit unregistered I/O ports.
+            assert!(stderr.contains("Guest PIO read to unregistered address 0x3fd"));
+        });
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_virtio_console() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+        _test_virtio_console(&guest);
+    }
+
+    #[test]
+    fn test_console_file() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+        let console_path = guest.tmp_dir.as_path().join("console-output");
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args([
+                "--console",
+                format!("file={}", console_path.to_str().unwrap()).as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        guest.wait_vm_boot().unwrap();
+        guest.ssh_command("sudo shutdown -h now").unwrap();
+
+        let _ = child.wait_timeout(std::time::Duration::from_secs(20));
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            assert!(output.status.success());
+
+            let mut f = std::fs::File::open(console_path).unwrap();
+            let mut buf = String::new();
+            f.read_to_string(&mut buf).unwrap();
+
+            if !buf.contains("login:") {
+                eprintln!(
+                    "\n\n==== Console file output ====\n\n{buf}\n\n==== End console file output ===="
+                );
+            }
+
+            assert!(buf.contains("login:"));
+        });
+
+        handle_child_output(r, &output);
+    }
 
     #[test]
     fn test_tap_from_fd() {

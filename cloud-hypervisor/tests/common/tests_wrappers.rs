@@ -3000,7 +3000,7 @@ pub(crate) fn _test_landlock(guest: &Guest) {
     handle_child_output(r, &output);
 }
 
-pub(crate) fn _test_disk_hotplug(guest: &Guest, landlock_enabled: bool) {
+fn _test_disk_hotplug_internal(guest: &Guest, landlock_enabled: bool, check_reboot: bool) {
     let api_socket = temp_api_path(&guest.tmp_dir);
 
     let mut blk_file_path = dirs::home_dir().unwrap();
@@ -3104,45 +3104,55 @@ pub(crate) fn _test_disk_hotplug(guest: &Guest, landlock_enabled: bool) {
             .ssh_command("sudo dd if=/dev/vdc of=/dev/null bs=1M iflag=direct count=16")
             .unwrap();
 
-        // Reboot the VM.
-        guest.reboot_linux(0);
+        if check_reboot {
+            // Reboot the VM.
+            guest.reboot_linux(0);
 
-        // Check still there after reboot
-        assert_eq!(
-            guest
-                .ssh_command("lsblk | grep vdc | grep -c 16M")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or_default(),
-            1
-        );
+            // Check still there after reboot
+            assert_eq!(
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
 
-        assert!(remote_command(&api_socket, "remove-device", Some("test0")));
+            assert!(remote_command(&api_socket, "remove-device", Some("test0")));
 
-        // Wait for the disk to disappear
-        assert!(wait_until(Duration::from_secs(20), || guest
-            .ssh_command("lsblk | grep -c vdc.*16M || true")
-            .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or(1) == 0)));
-
-        guest.reboot_linux(1);
-
-        // Check device still absent
-        assert_eq!(
-            guest
+            // Wait for the disk to disappear
+            assert!(wait_until(Duration::from_secs(20), || guest
                 .ssh_command("lsblk | grep -c vdc.*16M || true")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(1),
-            0
-        );
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or(1) == 0)));
+
+            guest.reboot_linux(1);
+
+            // Check device still absent
+            assert_eq!(
+                guest
+                    .ssh_command("lsblk | grep -c vdc.*16M || true")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or(1),
+                0
+            );
+        }
     });
 
     kill_child(&mut child);
     let output = child.wait_with_output().unwrap();
 
     handle_child_output(r, &output);
+}
+
+pub(crate) fn _test_disk_hotplug(guest: &Guest, landlock_enabled: bool) {
+    _test_disk_hotplug_internal(guest, landlock_enabled, true);
+}
+
+pub(crate) fn _test_disk_hotplug_no_reboot(guest: &Guest, landlock_enabled: bool) {
+    _test_disk_hotplug_internal(guest, landlock_enabled, false);
 }
 
 pub(crate) fn _test_virtio_block_topology(guest: &Guest, loop_dev: &str) {
