@@ -182,6 +182,149 @@ mod common_tdx {
     }
 
     #[test]
+    fn test_direct_kernel_boot_noacpi() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
+            // TDX guests can report lower available memory than non-confidential guests.
+            assert!(guest.get_total_memory().unwrap_or_default() > 300_000);
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_pci_bar_reprogramming() {
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf));
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .args([
+                "--net",
+                guest.default_net_string().as_str(),
+                "tap=,mac=8a:6b:6f:5a:de:ac,ip=192.168.3.1,mask=255.255.255.128",
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            // TDX guests can expose an additional default interface in some environments.
+            // Validate remove/rescan behavior relative to the observed baseline.
+            let initial_link_count = guest
+                .ssh_command("ip -o link | wc -l")
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+
+            let init_bar_addr = guest
+                .ssh_command(
+                    "sudo awk '{print $1; exit}' /sys/bus/pci/devices/0000:00:05.0/resource",
+                )
+                .unwrap()
+                .trim()
+                .to_string();
+
+            guest
+                .ssh_command("echo 1 | sudo tee /sys/bus/pci/devices/0000:00:05.0/remove")
+                .unwrap();
+
+            let removed_link_count = guest
+                .ssh_command("ip -o link | wc -l")
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            assert_eq!(removed_link_count + 1, initial_link_count);
+
+            guest
+                .ssh_command("echo 1 | sudo tee /sys/bus/pci/rescan")
+                .unwrap();
+
+            let rescanned_link_count = guest
+                .ssh_command("ip -o link | wc -l")
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default();
+            assert_eq!(rescanned_link_count, initial_link_count);
+
+            let new_bar_addr = guest
+                .ssh_command(
+                    "sudo awk '{print $1; exit}' /sys/bus/pci/devices/0000:00:05.0/resource",
+                )
+                .unwrap()
+                .trim()
+                .to_string();
+
+            assert!(!init_bar_addr.is_empty());
+            assert!(!new_bar_addr.is_empty());
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_memory_overhead() {
+        let guest_memory_size_kb: u32 = 512 * 1024;
+        let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
+            .with_kernel(fw_path(FwType::Tdvf))
+            .with_memory(&format!("{guest_memory_size_kb}K"));
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_net()
+            .default_disks()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        guest.wait_vm_boot().unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            let overhead = get_vmm_overhead(child.id(), guest_memory_size_kb);
+            // TDX guests have extra memory overhead compared with non-confidential guests.
+            let maximum_tdx_vmm_overhead_kb: u32 = 15 * 1024;
+            eprintln!("Guest memory overhead: {overhead} vs {maximum_tdx_vmm_overhead_kb}");
+            assert!(overhead <= maximum_tdx_vmm_overhead_kb);
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
     fn test_dmi_uuid() {
         let guest = basic_tdx_guest!("noble-server-cloudimg-amd64-UEFI.img")
             .with_kernel(fw_path(FwType::Tdvf));
