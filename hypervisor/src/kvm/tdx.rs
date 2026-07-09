@@ -98,54 +98,77 @@ pub(crate) struct KvmTdxInitMemRegion {
     pub nr_pages: u64,
 }
 
+// Layout of `struct { __u64 flags; __u64 nr; union { ... }; } tdx;` within the
+// `KVM_EXIT_TDX` arm of the top-level `kvm_run` union, as defined by the
+// running kernel's `include/uapi/linux/kvm.h`. Note this differs from older
+// (pre-upstream) KVM/TDX ABI proposals that used a generic `vmcall` struct
+// with `subfunction`/`in_r12..in_rdx`/`status_code`/`out_r11..out_rdx`
+// fields; that layout is *not* what current upstream kernels expose.
 #[allow(dead_code)]
+#[repr(C)]
 #[derive(Copy, Clone)]
 pub struct KvmTdxExit {
-    pub type_: u32,
-    pub pad: u32,
+    pub flags: u64,
+    /// TDVMCALL subfunction/leaf number (e.g. `TDG_VP_VMCALL_GET_QUOTE`).
+    pub nr: u64,
     pub u: KvmTdxExitU,
 }
 
+// `ret` is always the first `u64` of every variant below, so it aliases the
+// same offset (16 bytes into `KvmTdxExit`) regardless of which variant is
+// active. This lets `set_tdx_status()` write the TDVMCALL return status
+// through any variant without needing to know which one KVM populated.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union KvmTdxExitU {
-    pub vmcall: KvmTdxExitVmcall,
+    pub unknown: KvmTdxExitUnknown,
+    pub get_quote: KvmTdxExitGetQuote,
+    pub get_tdvmcall_info: KvmTdxExitGetTdVmCallInfo,
+    pub setup_event_notify: KvmTdxExitSetupEventNotify,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, PartialEq)]
-pub struct KvmTdxExitVmcall {
-    pub type_: u64,
-    pub subfunction: u64,
-    pub reg_mask: u64,
-    pub in_r12: u64,
-    pub in_r13: u64,
-    pub in_r14: u64,
-    pub in_r15: u64,
-    pub in_rbx: u64,
-    pub in_rdi: u64,
-    pub in_rsi: u64,
-    pub in_r8: u64,
-    pub in_r9: u64,
-    pub in_rdx: u64,
-    pub status_code: u64,
-    pub out_r11: u64,
-    pub out_r12: u64,
-    pub out_r13: u64,
-    pub out_r14: u64,
-    pub out_r15: u64,
-    pub out_rbx: u64,
-    pub out_rdi: u64,
-    pub out_rsi: u64,
-    pub out_r8: u64,
-    pub out_r9: u64,
-    pub out_rdx: u64,
+#[derive(Debug, Copy, Clone)]
+pub struct KvmTdxExitUnknown {
+    pub ret: u64,
+    pub data: [u64; 5],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct KvmTdxExitGetQuote {
+    pub ret: u64,
+    pub gpa: u64,
+    pub size: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct KvmTdxExitGetTdVmCallInfo {
+    pub ret: u64,
+    pub leaf: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct KvmTdxExitSetupEventNotify {
+    pub ret: u64,
+    pub vector: u64,
 }
 
 // Compile-time ABI guards: keep these Rust struct layouts aligned with
 // the corresponding KVM/TDX kernel definitions.
 const _: () = assert!(size_of::<KvmTdxCmd>() == 24);
 const _: () = assert!(size_of::<KvmTdxInitMemRegion>() == 24);
+const _: () = assert!(size_of::<KvmTdxExitUnknown>() == 48);
+const _: () = assert!(size_of::<KvmTdxExitGetQuote>() == 24);
+const _: () = assert!(size_of::<KvmTdxExitGetTdVmCallInfo>() == 48);
+const _: () = assert!(size_of::<KvmTdxExitSetupEventNotify>() == 16);
+const _: () = assert!(size_of::<KvmTdxExit>() == 64);
 const _: () = assert!(
     size_of::<kvm_cpuid2>()
         == size_of::<u32>() * 2

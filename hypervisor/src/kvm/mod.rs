@@ -3538,29 +3538,40 @@ impl cpu::Vcpu for KvmVcpu {
     fn get_tdx_exit_details(&mut self) -> cpu::Result<TdxExitDetails> {
         let kvm_run = self.fd.get_kvm_run();
         // SAFETY: accessing a union field in a valid structure
-        let tdx_vmcall = unsafe {
-            &mut (*((&raw mut kvm_run.__bindgen_anon_1).cast::<KvmTdxExit>()))
-                .u
-                .vmcall
+        let tdx_exit = unsafe {
+            use kvm_bindings::kvm_run__bindgen_ty_1;
+
+            &mut *((&mut kvm_run.__bindgen_anon_1) as *mut kvm_run__bindgen_ty_1 as *mut KvmTdxExit)
         };
 
-        tdx_vmcall.status_code = TDG_VP_VMCALL_INVALID_OPERAND;
-
-        if tdx_vmcall.type_ != 0 {
-            return Err(cpu::HypervisorCpuError::UnknownTdxVmCall);
-        }
-
-        match tdx_vmcall.subfunction {
-            TDG_VP_VMCALL_GET_QUOTE => Ok(TdxExitDetails::GetQuote {
-                gpa: tdx_vmcall.in_r12,
-                size: tdx_vmcall.in_r13,
-            }),
-            TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT => {
-                Ok(TdxExitDetails::SetupEventNotifyInterrupt {
-                    vector: tdx_vmcall.in_r12 as u8,
+        match tdx_exit.nr {
+            TDG_VP_VMCALL_GET_QUOTE => {
+                // SAFETY: `nr` == TDG_VP_VMCALL_GET_QUOTE, so KVM populated
+                // the `get_quote` variant of the union.
+                let get_quote = unsafe { &mut tdx_exit.u.get_quote };
+                get_quote.ret = TDG_VP_VMCALL_INVALID_OPERAND;
+                Ok(TdxExitDetails::GetQuote {
+                    gpa: get_quote.gpa,
+                    size: get_quote.size,
                 })
             }
-            _ => Err(cpu::HypervisorCpuError::UnknownTdxVmCall),
+            TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT => {
+                // SAFETY: `nr` == TDG_VP_VMCALL_SETUP_EVENT_NOTIFY_INTERRUPT,
+                // so KVM populated the `setup_event_notify` variant.
+                let setup_event_notify = unsafe { &mut tdx_exit.u.setup_event_notify };
+                setup_event_notify.ret = TDG_VP_VMCALL_INVALID_OPERAND;
+                Ok(TdxExitDetails::SetupEventNotifyInterrupt {
+                    vector: setup_event_notify.vector as u8,
+                })
+            }
+            _ => {
+                // SAFETY: `unknown` is a valid fallback view of the union
+                // for subfunctions we don't otherwise handle; `ret` aliases
+                // the same offset in every variant.
+                let unknown = unsafe { &mut tdx_exit.u.unknown };
+                unknown.ret = TDG_VP_VMCALL_INVALID_OPERAND;
+                Err(cpu::HypervisorCpuError::UnknownTdxVmCall)
+            }
         }
     }
 
@@ -3571,16 +3582,22 @@ impl cpu::Vcpu for KvmVcpu {
     fn set_tdx_status(&mut self, status: TdxExitStatus) {
         let kvm_run = self.fd.get_kvm_run();
         // SAFETY: accessing a union field in a valid structure
-        let tdx_vmcall = unsafe {
-            &mut (*((&raw mut kvm_run.__bindgen_anon_1).cast::<KvmTdxExit>()))
-                .u
-                .vmcall
+        let tdx_exit = unsafe {
+            use kvm_bindings::kvm_run__bindgen_ty_1;
+
+            &mut *((&mut kvm_run.__bindgen_anon_1) as *mut kvm_run__bindgen_ty_1 as *mut KvmTdxExit)
         };
 
-        tdx_vmcall.status_code = match status {
+        let ret = match status {
             TdxExitStatus::Success => TDG_VP_VMCALL_SUCCESS,
             TdxExitStatus::InvalidOperand => TDG_VP_VMCALL_INVALID_OPERAND,
         };
+
+        // `ret` is the first field of every union variant, so writing it
+        // through the `unknown` variant aliases the same status word
+        // regardless of which TDVMCALL subfunction is currently pending.
+        // Writing (unlike reading) a union field is not `unsafe`.
+        tdx_exit.u.unknown.ret = ret;
     }
 
     #[cfg(target_arch = "x86_64")]
