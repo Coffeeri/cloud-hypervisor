@@ -278,7 +278,7 @@ fn make_segment(sev_selector: SevSelector) -> Segment {
 }
 
 #[cfg(feature = "tdx")]
-const KVM_EXIT_TDX: u32 = 50;
+const KVM_EXIT_TDX: u32 = 40;
 #[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_GET_QUOTE: u64 = 0x10002;
 #[cfg(feature = "tdx")]

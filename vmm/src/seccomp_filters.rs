@@ -915,7 +915,14 @@ fn vcpu_thread_rules(
         (libc::SYS_brk, vec![]),
         (libc::SYS_clock_gettime, vec![]),
         (libc::SYS_clock_nanosleep, vec![]),
+        // Needed to spawn the async TDX QGS quote worker thread
+        // (tdx_qgs::spawn_get_quote_worker) from the vCPU exit-handling loop.
+        (libc::SYS_clone, vec![]),
+        (libc::SYS_clone3, vec![]),
         (libc::SYS_close, vec![]),
+        // Needed by the TDX QGS worker thread to connect to the host QGS
+        // daemon over a Unix domain socket.
+        (libc::SYS_connect, vec![]),
         (libc::SYS_dup, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_epoll_ctl, vec![]),
@@ -961,6 +968,13 @@ fn vcpu_thread_rules(
         (libc::SYS_sched_yield, vec![]),
         (libc::SYS_sendmsg, vec![]),
         (libc::SYS_sendto, vec![]),
+        // Restricted to AF_UNIX: used by the TDX QGS worker thread to talk
+        // to the host QGS daemon (vmm/src/tdx_qgs.rs).
+        (
+            libc::SYS_socket,
+            or![and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_UNIX as u64)?]],
+        ),
+        (libc::SYS_setsockopt, vec![]),
         (libc::SYS_shutdown, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_statx, vec![]),
