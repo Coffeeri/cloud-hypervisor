@@ -1670,6 +1670,22 @@ impl Vm {
                 .unwrap();
             vm.set_tss_address(KVM_TSS_START.0 as usize).unwrap();
             vm.enable_split_irq().unwrap();
+
+            #[cfg(feature = "tdx")]
+            if config.tdx_enabled {
+                // TDX guests cannot use the TSC-deadline timer (unsupported
+                // by the TDX module) and therefore fall back to the legacy
+                // one-shot/periodic APIC counter-register timer mode, which
+                // the guest kernel calibrates against the core crystal
+                // clock frequency it is told about via CPUID leaf 0x15
+                // (always 25MHz, i.e. a 40ns cycle, for TDX). KVM's
+                // in-kernel LAPIC emulation otherwise defaults this period
+                // to 1ns (1GHz bus), so without this call the emulated
+                // timer fires ~40x too fast, causing an interrupt storm.
+                // This mirrors QEMU's TDX_APIC_BUS_CYCLES_NS handling.
+                const TDX_APIC_BUS_CYCLES_NS: u64 = 40;
+                vm.enable_apic_bus_cycles_ns(TDX_APIC_BUS_CYCLES_NS).unwrap();
+            }
         }
 
         Ok(vm)

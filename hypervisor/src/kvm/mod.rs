@@ -82,7 +82,8 @@ mod tdx;
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_GUESTDBG_USE_HW_BP,
+    KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API,
+    KVM_CAP_X86_APIC_BUS_CYCLES_NS, KVM_GUESTDBG_USE_HW_BP,
     KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS, MsrList, kvm_enable_cap,
     kvm_msr_entry,
 };
@@ -1551,6 +1552,23 @@ impl vm::Vm for KvmVm {
             std::ptr::null(),
         )
         .map_err(vm::HypervisorVmError::FinalizeTdx)
+    }
+
+    ///
+    /// Configure the APIC bus (core crystal clock) cycle period used by
+    /// KVM's in-kernel LAPIC emulation. See the `enable_apic_bus_cycles_ns`
+    /// documentation on the `Vm` trait for details.
+    ///
+    #[cfg(feature = "tdx")]
+    fn enable_apic_bus_cycles_ns(&self, cycles_ns: u64) -> vm::Result<()> {
+        let mut cap = kvm_enable_cap {
+            cap: KVM_CAP_X86_APIC_BUS_CYCLES_NS,
+            ..Default::default()
+        };
+        cap.args[0] = cycles_ns;
+        self.fd
+            .enable_cap(&cap)
+            .map_err(|e| vm::HypervisorVmError::EnableApicBusCyclesNs(e.into()))
     }
 
     /// Downcast to the underlying KvmVm type

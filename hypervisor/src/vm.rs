@@ -139,6 +139,11 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to enable x2apic API")]
     EnableX2ApicApi(#[source] anyhow::Error),
+    ///
+    /// Enable APIC bus cycles ns error
+    ///
+    #[error("Failed to enable APIC bus cycles ns")]
+    EnableApicBusCyclesNs(#[source] anyhow::Error),
     /// Get clock error
     ///
     #[error("Failed to get clock")]
@@ -473,6 +478,21 @@ pub trait Vm: Send + Sync + Any {
     #[cfg(feature = "tdx")]
     /// Finalize the configuration of TDX on this VM
     fn tdx_finalize(&self) -> Result<()> {
+        unimplemented!()
+    }
+    #[cfg(feature = "tdx")]
+    /// Configure the APIC bus (core crystal clock) cycle period, in
+    /// nanoseconds, used by KVM's in-kernel LAPIC emulation.
+    ///
+    /// TDX guests cannot use the TSC-deadline timer (unsupported by the
+    /// TDX module), so they fall back to the legacy one-shot/periodic
+    /// APIC counter-register timer mode, which the guest kernel
+    /// calibrates against the core crystal clock frequency reported via
+    /// CPUID leaf 0x15. KVM otherwise defaults this internal period to
+    /// 1ns (i.e. a 1GHz bus), so unless it is corrected to match the
+    /// crystal clock actually exposed to the guest, the emulated LAPIC
+    /// timer fires far too rapidly.
+    fn enable_apic_bus_cycles_ns(&self, _cycles_ns: u64) -> Result<()> {
         unimplemented!()
     }
     /// Downcast to the underlying hypervisor VM type
