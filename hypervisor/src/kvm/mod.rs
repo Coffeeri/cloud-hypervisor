@@ -1517,9 +1517,20 @@ impl vm::Vm for KvmVm {
             kvm_bindings::kvm_cpuid_entry2::default(),
         );
 
+        // XFAM (the set of XSAVE state components enabled for this TD) must
+        // be a subset of `supported_xfam` reported by `KVM_TDX_CAPABILITIES`
+        // (the kernel rejects `KVM_TDX_INIT_VM` with EINVAL otherwise, see
+        // `setup_tdparams()` in the kernel's `arch/x86/kvm/vmx/tdx.c`).
+        //
+        // Mask them out here so Cloud Hypervisor's TDX guest CPUID matches QEMU.
+        const XSTATE_CET_U_BIT: u64 = 11;
+        const XSTATE_CET_S_BIT: u64 = 12;
+        let xfam = self.tdx_capabilities()?.supported_xfam
+            & !((1 << XSTATE_CET_U_BIT) | (1 << XSTATE_CET_S_BIT));
+
         let data = KvmTdxInitVm {
             attributes: 1 << TDX_ATTR_SEPT_VE_DISABLE,
-            xfam: 0,
+            xfam,
             mrconfigid: [0; 6],
             mrowner: [0; 6],
             mrownerconfig: [0; 6],
