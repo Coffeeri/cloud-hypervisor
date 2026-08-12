@@ -98,7 +98,7 @@ pub fn setup_msrs(vcpu: &dyn hypervisor::Vcpu) -> Result<()> {
 
     // Check that all setup entries were set. We can only do this for KVM
     // (when SEV-SNP is not enabled) as MSHV always returns Ok(0) on success.
-    #[cfg(all(feature = "kvm", not(feature = "sev_snp")))]
+    #[cfg(all(feature = "kvm", not(any(feature = "sev_snp", feature = "tdx"))))]
     if matches!(vcpu.hypervisor_type(), hypervisor::HypervisorType::Kvm)
         && num_msrs_set != setup_entries.len()
     {

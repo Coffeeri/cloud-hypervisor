@@ -83,9 +83,8 @@ pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
     KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API,
-    KVM_CAP_X86_APIC_BUS_CYCLES_NS, KVM_GUESTDBG_USE_HW_BP,
-    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS, MsrList, kvm_enable_cap,
-    kvm_msr_entry,
+    KVM_CAP_X86_APIC_BUS_CYCLES_NS, KVM_GUESTDBG_USE_HW_BP, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK,
+    KVM_X2APIC_API_USE_32BIT_IDS, MsrList, kvm_enable_cap, kvm_msr_entry,
 };
 #[cfg(target_arch = "x86_64")]
 use x86_64::check_required_kvm_extensions;
