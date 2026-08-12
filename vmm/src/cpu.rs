@@ -1352,7 +1352,7 @@ impl CpuManager {
         let tdx_event_notify_interrupt_manager =
             std::panic::AssertUnwindSafe(self.tdx_event_notify_interrupt_manager.clone());
         #[cfg(feature = "tdx")]
-        let tdx_event_notify = self.vcpu_states.lock().unwrap()[usize::try_from(vcpu_id).unwrap()]
+        let tdx_event_notify = vcpu_states[usize::try_from(vcpu_id).unwrap()]
             .tdx_event_notify
             .clone();
         #[cfg(target_arch = "x86_64")]
