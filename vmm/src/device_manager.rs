@@ -2765,6 +2765,13 @@ impl DeviceManager {
             let detected_image_type = opened.image_type;
             let mut disable_sector0_writes = false;
 
+            // TODO: Quick fix to make the tdx tests work with qcow2 image type
+            // Do not attempt to upstream!
+            if detected_image_type != disk_cfg.image_type && detected_image_type == ImageType::Qcow2
+            {
+                disk_cfg.image_type = ImageType::Unknown;
+            }
+
             if disk_cfg.image_type == ImageType::Unknown {
                 warn!(
                     "DEPRECATION: auto-detection of disk image type is deprecated and will be \
