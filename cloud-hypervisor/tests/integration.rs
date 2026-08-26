@@ -7470,6 +7470,140 @@ mod common_parallel {
         _test_live_migration(false, true, true);
     }
 
+    #[derive(Clone, Copy)]
+    enum GuestLifecycleAction {
+        Reboot,
+        Shutdown,
+    }
+
+    fn wait_for_vm_event(event: &str, event_path: &str) {
+        let expected = MetaEvent {
+            event: event.to_string(),
+            device_id: None,
+        };
+        assert!(wait_for_sequential_events(
+            Duration::from_secs(30),
+            &[&expected],
+            event_path,
+        ));
+    }
+
+    fn _test_live_migration_guest_lifecycle(action: GuestLifecycleAction) {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME).with_memory("1500M");
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let src_event_path = temp_event_monitor_path(&guest.tmp_dir);
+
+        let mut src_child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--api-socket", &src_api_socket])
+            .args(["--event-monitor", format!("path={src_event_path}").as_str()])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
+        dest_api_socket.push_str(".dest");
+        let dest_event_path = format!("{src_event_path}.dest");
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .args([
+                "--event-monitor",
+                format!("path={dest_event_path}").as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            guest.wait_vm_boot().unwrap();
+            let reboot_count = get_reboot_count(&guest);
+
+            guest
+                .ssh_command("nohup stress --vm 2 --vm-bytes 220M --vm-keep &>/dev/null &")
+                .unwrap();
+
+            let migration_port = get_available_port();
+            let receive_url = format!("receiver_url=tcp:0.0.0.0:{migration_port}");
+            let receive_api_socket = dest_api_socket.clone();
+            let receive_migration = thread::spawn(move || {
+                remote_command(&receive_api_socket, "receive-migration", Some(&receive_url))
+            });
+
+            wait_for_vm_event("migration-receive-ready", &dest_event_path);
+
+            assert!(remote_command(
+                &src_api_socket,
+                "send-migration",
+                Some(&format!(
+                    "destination_url=tcp:127.0.0.1:{migration_port},downtime_ms=1,timeout_s=30,timeout_strategy=cancel"
+                )),
+            ));
+
+            wait_for_vm_event("migration-started", &src_event_path);
+
+            let lifecycle_command = match action {
+                GuestLifecycleAction::Reboot => "sudo reboot",
+                GuestLifecycleAction::Shutdown => "sudo shutdown -h now",
+            };
+            guest.ssh_command(lifecycle_command).unwrap();
+
+            wait_for_vm_event("migration-finished", &src_event_path);
+            assert!(receive_migration.join().unwrap());
+            assert!(wait_until(Duration::from_secs(30), || {
+                matches!(src_child.try_wait(), Ok(Some(status)) if status.success())
+            }));
+
+            match action {
+                GuestLifecycleAction::Reboot => {
+                    guest.wait_vm_boot().unwrap();
+                    assert_eq!(get_reboot_count(&guest), reboot_count + 1);
+                    wait_for_vm_event("rebooting", &dest_event_path);
+                    wait_for_vm_event("rebooted", &dest_event_path);
+                }
+                GuestLifecycleAction::Shutdown => {
+                    wait_for_vm_event("shutdown", &dest_event_path);
+                    assert!(
+                        dest_child
+                            .wait_timeout(Duration::from_secs(30))
+                            .unwrap()
+                            .is_some_and(|status| status.success())
+                    );
+                }
+            }
+        }));
+
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error handling a guest lifecycle event during live migration",
+            );
+        }
+
+        let _ = src_child.kill();
+        let src_output = src_child.wait_with_output().unwrap();
+        handle_child_output(Ok(()), &src_output);
+
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        handle_child_output(Ok(()), &dest_output);
+    }
+
+    #[test]
+    fn test_live_migration_guest_reboot() {
+        _test_live_migration_guest_lifecycle(GuestLifecycleAction::Reboot);
+    }
+
+    #[test]
+    fn test_live_migration_guest_shutdown() {
+        _test_live_migration_guest_lifecycle(GuestLifecycleAction::Shutdown);
+    }
+
     #[test]
     fn test_live_migration_tcp() {
         _test_live_migration_tcp(NonZeroU32::new(1).unwrap());
