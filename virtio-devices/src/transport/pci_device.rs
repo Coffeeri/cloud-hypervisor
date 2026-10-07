@@ -39,9 +39,9 @@ use vmm_sys_util::eventfd::EventFd;
 use super::pci_common_config::VirtioPciCommonConfigState;
 use crate::transport::{VIRTIO_PCI_COMMON_CONFIG_ID, VirtioPciCommonConfig, VirtioTransport};
 use crate::{
-    ActivateResult, ActivationContext, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER, DEVICE_DRIVER_OK,
-    DEVICE_FAILED, DEVICE_FEATURES_OK, DEVICE_INIT, GuestMemoryMmap, VirtioDevice,
-    VirtioDeviceType, VirtioInterrupt, VirtioInterruptType, mark_device_needs_reset,
+    ActivateResult, ActivationContext, DEVICE_DRIVER_OK, DEVICE_FAILED, DEVICE_INIT,
+    GuestMemoryMmap, VirtioDevice, VirtioDeviceType, VirtioInterrupt, VirtioInterruptType,
+    mark_device_needs_reset,
 };
 
 /// Vector value used to disable MSI for a queue.
@@ -689,10 +689,11 @@ impl VirtioPciDevice {
     }
 
     fn is_driver_ready(&self) -> bool {
-        let ready_bits =
-            (DEVICE_ACKNOWLEDGE | DEVICE_DRIVER | DEVICE_DRIVER_OK | DEVICE_FEATURES_OK) as u8;
         let driver_status = self.common_config.driver_status.load(Ordering::SeqCst);
-        driver_status == ready_bits && (driver_status & DEVICE_FAILED as u8) == 0
+        let driver_ready = driver_status & DEVICE_DRIVER_OK as u8 != 0;
+        let failed = driver_status & DEVICE_FAILED as u8 != 0;
+
+        driver_ready && !failed
     }
 
     /// Determines if the driver has requested the device (re)init / reset itself
