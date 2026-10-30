@@ -269,6 +269,8 @@ pub struct HypervisorVmConfig {
     pub mem_size: u64,
     #[cfg(feature = "sev_snp")]
     pub vmsa_features: u64,
+    #[cfg(feature = "tdx")]
+    pub tdx_enabled: bool,
     pub nested: bool,
     pub smt_enabled: bool,
 }

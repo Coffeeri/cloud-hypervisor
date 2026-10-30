@@ -34,6 +34,10 @@ pub enum HypervisorError {
     /// Vm creation failure
     #[error("Failed to create Vm")]
     VmCreate(#[source] anyhow::Error),
+    /// The host does not support TDX
+    #[cfg(feature = "tdx")]
+    #[error("TDX is not supported on this host")]
+    TdxUnavailable,
     /// CpuId error
     #[error("Failed to get cpuid")]
     GetCpuId(#[source] anyhow::Error),

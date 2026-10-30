@@ -37,7 +37,12 @@ sev_snp = [
   "igvm",
   "virtio-devices/sev_snp",
 ]
-tdx = ["arch/tdx", "hypervisor/tdx"]
+tdx = [
+  "arch/tdx",
+  "hypervisor/tdx",
+  "igvm",
+  "kvm",
+]
 tracing = ["tracer/tracing"]
 
 [dependencies]

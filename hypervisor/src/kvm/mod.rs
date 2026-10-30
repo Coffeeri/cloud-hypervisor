@@ -108,6 +108,8 @@ compile_error!("The `tdx` feature is only supported on x86_64");
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_X86_DEFAULT_VM;
+#[cfg(all(feature = "tdx", target_arch = "x86_64"))]
+use kvm_bindings::KVM_X86_TDX_VM;
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use kvm_bindings::kvm_vcpu_events as VcpuEvents;
@@ -1507,6 +1509,15 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             #[cfg(feature = "sev_snp")]
             if _config.sev_snp_enabled {
                 vm_type = KVM_X86_SNP_VM.into();
+            }
+
+            #[cfg(feature = "tdx")]
+            if _config.tdx_enabled {
+                let vm_types = self.kvm.check_extension_int(Cap::VmTypes);
+                if vm_types & (1 << KVM_X86_TDX_VM) == 0 {
+                    return Err(hypervisor::HypervisorError::TdxUnavailable);
+                }
+                vm_type = KVM_X86_TDX_VM.into();
             }
         }
 

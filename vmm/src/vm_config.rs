@@ -170,6 +170,18 @@ pub struct PlatformConfig {
     #[cfg(feature = "sev_snp")]
     #[serde(default)]
     pub sev_snp: bool,
+    #[cfg(feature = "tdx")]
+    #[serde(default)]
+    pub tdx: bool,
+    #[cfg(feature = "tdx")]
+    #[serde(default)]
+    pub tdx_mrconfigid: Option<String>,
+    #[cfg(feature = "tdx")]
+    #[serde(default)]
+    pub tdx_mrowner: Option<String>,
+    #[cfg(feature = "tdx")]
+    #[serde(default)]
+    pub tdx_mrownerconfig: Option<String>,
     #[serde(default)]
     pub iommufd: bool,
     // Deserialized FD numbers carry no ownership and are discarded.

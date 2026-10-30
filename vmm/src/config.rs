@@ -445,6 +445,22 @@ pub enum ValidationError {
     #[cfg(feature = "sev_snp")]
     #[error("Passthrough devices require --platform iommufd=on with SEV-SNP")]
     SevSnpRequiresIommufd,
+    /// TDX measurement values were given without enabling TDX
+    #[cfg(feature = "tdx")]
+    #[error("mrconfigid/mrowner/mrownerconfig require 'tdx=on'")]
+    TdxMeasurementWithoutTdx,
+    /// A TDX measurement value is not a SHA-384 digest in hex
+    #[cfg(feature = "tdx")]
+    #[error("Invalid TDX {0}: {1}")]
+    InvalidTdxMeasurement(&'static str, String),
+    /// TDX needs an IGVM payload
+    #[cfg(feature = "tdx")]
+    #[error("TDX requires an IGVM payload (--igvm <path>)")]
+    TdxRequiresIgvm,
+    /// TDX and SEV-SNP are mutually exclusive
+    #[cfg(all(feature = "tdx", feature = "sev_snp"))]
+    #[error("Platform cannot be both TDX and SEV-SNP")]
+    TdxAndSevSnpAreExclusive,
     /// Restore expects all net ids that have fds
     #[error("Net id {0} is associated with FDs and is required")]
     RestoreMissingRequiredNetId(String),
@@ -1067,6 +1083,13 @@ impl PlatformConfig {
                 syntax.push_str(",sev_snp=on|off");
             }
 
+            if cfg!(feature = "tdx") {
+                syntax.push_str(
+                    ",tdx=on|off,mrconfigid=<sha384_hex>,mrowner=<sha384_hex>,\
+                     mrownerconfig=<sha384_hex>",
+                );
+            }
+
             syntax.push('"');
 
             syntax
@@ -1129,6 +1152,14 @@ impl PlatformConfig {
         for field in SMBIOS_STRING_FIELDS {
             parser.add(field.key);
         }
+        #[cfg(feature = "tdx")]
+        parser.add("tdx");
+        #[cfg(feature = "tdx")]
+        parser.add("mrconfigid");
+        #[cfg(feature = "tdx")]
+        parser.add("mrowner");
+        #[cfg(feature = "tdx")]
+        parser.add("mrownerconfig");
         #[cfg(feature = "sev_snp")]
         parser.add("sev_snp");
         parser.parse(platform).map_err(Error::ParsePlatform)?;
@@ -1164,6 +1195,24 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(true))
             .0;
+        #[cfg(feature = "tdx")]
+        let tdx = parser
+            .convert::<Toggle>("tdx")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or(Toggle(false))
+            .0;
+        #[cfg(feature = "tdx")]
+        let tdx_mrconfigid = parser
+            .convert::<String>("mrconfigid")
+            .map_err(Error::ParsePlatform)?;
+        #[cfg(feature = "tdx")]
+        let tdx_mrowner = parser
+            .convert::<String>("mrowner")
+            .map_err(Error::ParsePlatform)?;
+        #[cfg(feature = "tdx")]
+        let tdx_mrownerconfig = parser
+            .convert::<String>("mrownerconfig")
+            .map_err(Error::ParsePlatform)?;
         #[cfg(feature = "sev_snp")]
         let sev_snp = parser
             .convert::<Toggle>("sev_snp")
@@ -1188,6 +1237,14 @@ impl PlatformConfig {
             iommufd_fd,
             #[cfg(feature = "sev_snp")]
             sev_snp,
+            #[cfg(feature = "tdx")]
+            tdx,
+            #[cfg(feature = "tdx")]
+            tdx_mrconfigid,
+            #[cfg(feature = "tdx")]
+            tdx_mrowner,
+            #[cfg(feature = "tdx")]
+            tdx_mrownerconfig,
             vfio_p2p_dma,
         };
 
@@ -1226,6 +1283,26 @@ impl PlatformConfig {
 
         if self.iommufd_fd.is_some() && !self.iommufd {
             return Err(ValidationError::IommufdFdRequiresIommufd);
+        }
+
+        #[cfg(feature = "tdx")]
+        {
+            let digests = [
+                ("mrconfigid", &self.tdx_mrconfigid),
+                ("mrowner", &self.tdx_mrowner),
+                ("mrownerconfig", &self.tdx_mrownerconfig),
+            ];
+
+            if !self.tdx && digests.iter().any(|(_, digest)| digest.is_some()) {
+                return Err(ValidationError::TdxMeasurementWithoutTdx);
+            }
+
+            for (name, digest) in digests {
+                if let Some(digest) = digest {
+                    hex::decode_to_slice(digest, &mut [0u8; 48])
+                        .map_err(|e| ValidationError::InvalidTdxMeasurement(name, e.to_string()))?;
+                }
+            }
         }
 
         Ok(())
@@ -3607,6 +3684,22 @@ impl VmConfig {
             ))?
             .validate()?;
 
+        #[cfg(all(feature = "sev_snp", feature = "tdx"))]
+        if self.is_tdx_enabled() && self.is_sev_snp_enabled() {
+            return Err(ValidationError::TdxAndSevSnpAreExclusive);
+        }
+
+        #[cfg(feature = "tdx")]
+        if self.is_tdx_enabled()
+            && self
+                .payload
+                .as_ref()
+                .and_then(|p| p.igvm.as_ref())
+                .is_none()
+        {
+            return Err(ValidationError::TdxRequiresIgvm);
+        }
+
         #[cfg(feature = "sev_snp")]
         {
             let sev_snp_enabled = self.platform.as_ref().is_some_and(|p| p.sev_snp);
@@ -4384,6 +4477,11 @@ impl VmConfig {
     #[cfg(feature = "sev_snp")]
     pub fn is_sev_snp_enabled(&self) -> bool {
         self.platform.as_ref().is_some_and(|p| p.sev_snp)
+    }
+
+    #[cfg(feature = "tdx")]
+    pub fn is_tdx_enabled(&self) -> bool {
+        self.platform.as_ref().is_some_and(|p| p.tdx)
     }
 }
 
@@ -6672,6 +6770,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             chassis_asset_tag: None,
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
+            #[cfg(feature = "tdx")]
+            tdx: false,
+            #[cfg(feature = "tdx")]
+            tdx_mrconfigid: None,
+            #[cfg(feature = "tdx")]
+            tdx_mrowner: None,
+            #[cfg(feature = "tdx")]
+            tdx_mrownerconfig: None,
         }
     }
 
@@ -6684,6 +6790,68 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             memory_zones: None,
             pci_segments: None,
         }
+    }
+
+    #[test]
+    #[cfg(feature = "tdx")]
+    fn test_tdx_measurements() {
+        let digest = "ab".repeat(48);
+
+        let platform = PlatformConfig::parse("num_pci_segments=1").unwrap();
+        assert!(!platform.tdx);
+        assert_eq!(platform.tdx_mrowner, None);
+
+        let platform = PlatformConfig::parse(&format!("mrowner={digest}")).unwrap();
+        assert_eq!(
+            platform.validate(),
+            Err(ValidationError::TdxMeasurementWithoutTdx)
+        );
+
+        let platform = PlatformConfig::parse("tdx=on,mrowner=abc").unwrap();
+        assert!(matches!(
+            platform.validate(),
+            Err(ValidationError::InvalidTdxMeasurement("mrowner", _))
+        ));
+
+        let platform = PlatformConfig::parse(&format!(
+            "tdx=on,mrconfigid={digest},mrowner={digest},mrownerconfig={digest}"
+        ))
+        .unwrap();
+        platform.validate().unwrap();
+        assert_eq!(platform.tdx_mrowner.as_deref(), Some(digest.as_str()));
+    }
+
+    #[test]
+    #[cfg(feature = "tdx")]
+    fn test_tdx_requires_igvm() {
+        let mut config: VmConfig = serde_json::from_value(serde_json::json!({
+            "platform": { "tdx": true },
+            "payload": { "kernel": "/path/to/kernel" },
+        }))
+        .unwrap();
+        assert_eq!(config.validate(), Err(ValidationError::TdxRequiresIgvm));
+
+        let mut config: VmConfig = serde_json::from_value(serde_json::json!({
+            "platform": { "tdx": true },
+            "payload": { "igvm": "/path/to/igvm" },
+        }))
+        .unwrap();
+        config.validate().unwrap();
+        assert!(config.is_tdx_enabled());
+    }
+
+    #[test]
+    #[cfg(all(feature = "tdx", feature = "sev_snp"))]
+    fn test_tdx_and_sev_snp_are_exclusive() {
+        let mut config: VmConfig = serde_json::from_value(serde_json::json!({
+            "platform": { "tdx": true, "sev_snp": true },
+            "payload": { "igvm": "/path/to/igvm" },
+        }))
+        .unwrap();
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::TdxAndSevSnpAreExclusive)
+        );
     }
 
     #[test]
