@@ -143,6 +143,13 @@ uuid = { version = "1.23.2" }
 wait-timeout = "0.2.1"
 zbus = "5.15.0"
 zerocopy = { version = "0.8.50", default-features = false }
+[patch.crates-io]
+kvm-bindings = { git = "https://github.com/cyberus-technology/rust-vmm", rev = "5242bad188fee3d72647f6631a4ae38172c4653a" }
+kvm-ioctls = { git = "https://github.com/cyberus-technology/rust-vmm", rev = "5242bad188fee3d72647f6631a4ae38172c4653a" }
+# The branch's vmm-sys-util breaks released vfio-ioctls and duplicates the fam
+# types.
+[patch."https://github.com/cyberus-technology/rust-vmm"]
+vmm-sys-util = { version = "0.15.0" }
 
 [workspace.lints.clippy]
 # Any clippy lint (group) in alphabetical order:
