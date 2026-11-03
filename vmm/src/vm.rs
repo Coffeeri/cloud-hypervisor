@@ -1304,6 +1304,26 @@ impl Vm {
             vm.enable_x2apic_api().unwrap();
         }
 
+        #[cfg(feature = "tdx")]
+        {
+            use crate::vm_config::DEFAULT_MAX_PHYS_BITS;
+
+            // KVM only accepts 48 or 52 bits in CPUID 0x80000008, a TD keeps
+            // the host's width.
+            // https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/kvm/vmx/tdx.c?h=v6.19#n2264
+            let mut config = vm_config.lock().unwrap();
+            if config.is_tdx_enabled() {
+                let host_phys_bits = get_host_cpu_phys_bits(hypervisor.as_ref());
+                let max_phys_bits = config.cpus.max_phys_bits;
+                if max_phys_bits != DEFAULT_MAX_PHYS_BITS && max_phys_bits != host_phys_bits {
+                    return Err(Error::ConfigValidation(
+                        ValidationError::TdxPhysBitsMismatch(max_phys_bits, host_phys_bits),
+                    ));
+                }
+                config.cpus.max_phys_bits = host_phys_bits;
+            }
+        }
+
         let phys_bits = physical_bits(
             hypervisor.as_ref(),
             vm_config.lock().unwrap().cpus.max_phys_bits,

@@ -461,6 +461,10 @@ pub enum ValidationError {
     #[cfg(all(feature = "tdx", feature = "sev_snp"))]
     #[error("Platform cannot be both TDX and SEV-SNP")]
     TdxAndSevSnpAreExclusive,
+    /// A TD runs with the host's physical address bits
+    #[cfg(feature = "tdx")]
+    #[error("TDX requires the guest's {0} physical address bits to be the host's {1} or unset")]
+    TdxPhysBitsMismatch(u8, u8),
     /// Restore expects all net ids that have fds
     #[error("Net id {0} is associated with FDs and is required")]
     RestoreMissingRequiredNetId(String),
